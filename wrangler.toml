@@ -99,7 +99,7 @@ mode = "smart"
 # Docs: https://developers.cloudflare.com/workers/wrangler/configuration/#r2-buckets
 [[r2_buckets]]
 binding = "MY_BUCKET"
-bucket_name = "yield-backend-cache"
+bucket_name = "moonwell-backend-cache"
 
 # Bind another Worker service. Use this binding to call another Worker without network overhead.
 # Docs: https://developers.cloudflare.com/workers/wrangler/configuration/#service-bindings

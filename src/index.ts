@@ -1,23 +1,43 @@
 import { createMoonwellClient } from '@moonwell-fi/moonwell-sdk';
+import type { ExecutionContext } from '@cloudflare/workers-types';
+import { serializeMarket } from './serializers/market';
+import { serializeVault } from './serializers/vault';
 
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Methods': 'GET,HEAD,POST,OPTIONS',
   'Access-Control-Max-Age': '86400',
+  'content-type': 'application/json'
 }
 
-const respond = (response: Record<string, unknown>, code?: number) =>
-  new Response(JSON.stringify(response), {
-    headers: { 'content-type': 'application/json', ...corsHeaders },
+const respond = (response: Record<string, unknown>, code: number = 200): Response => {
+  const body = JSON.stringify(response, null, 2);
+  const init = {
     status: code,
-  })
+    headers: corsHeaders,
+    statusText: code === 200 ? 'OK' : 'Error'
+  };
+  const res = new Response(body, init);
+  
+  // Log response for debugging
+  console.log('Created response:', res);
+  console.log('Response type:', typeof res);
+  console.log('Response properties:', Object.keys(res));
+  
+  return res;
+}
+
+export interface Env {
+  MY_BUCKET: R2Bucket;
+}
 
 export default {
   async fetch(
     request: Request,
-    env: Record<string, any>
-  ) {
-		const uri = 'market-vault-yields.json'
+    env: Env,
+    ctx: ExecutionContext
+  ): Promise<Response> {
+    const uri = 'market-vault-yields.json'
     const object = await env.MY_BUCKET.get(uri)
 
     if (
@@ -26,34 +46,54 @@ export default {
     ) { // Cached object is not found or older than 10 seconds
       console.log('Cache miss, fetching new data...')
       const moonwellClient = createMoonwellClient({
-				networks: {
-					base: {
-						rpcUrls: ["https://base.llamarpc.com"],
-					},
-				},
-			});
-
-			const markets = await moonwellClient.getMarkets({chainId: 8453});
-			const vaults = await moonwellClient.getMorphoVaults({includeRewards: true});
-
-			const response = {
-				markets: markets,
-				vaults: vaults
-			}
-
-      const data: Record<string, unknown> = await response
-      await env.MY_BUCKET.put(uri, JSON.stringify(data), {
-        metadata: {
-          'Content-Type': 'application/json',
+        networks: {
+          base: {
+            rpcUrls: ["https://base.llamarpc.com"],
+          },
         },
       });
-      return respond(data)
-    } else {
-      console.log('Cache hit, returning cached data...')
-      return new Response(object.body, {
-        headers: { 'content-type': 'application/json', ...corsHeaders },
-        status: 200,
-      })
+
+      const markets = await moonwellClient.getMarkets({chainId: 8453});
+      const vaults = await moonwellClient.getMorphoVaults({includeRewards: true});
+
+      // Create the output object
+      const output: {
+        markets: Record<string, any>;
+        vaults: Record<string, any>;
+      } = {
+        markets: {},
+        vaults: {}
+      };
+
+      // Serialize markets
+      markets.forEach(market => {
+        const serializedMarket = serializeMarket(market);
+        if (serializedMarket && serializedMarket.marketKey) {
+          output.markets[serializedMarket.marketKey] = serializedMarket;
+        }
+      });
+
+      // Serialize vaults
+      vaults.forEach(vault => {
+        const serializedVault = serializeVault(vault);
+        if (serializedVault && serializedVault.vaultKey) {
+          output.vaults[serializedVault.vaultKey] = serializedVault;
+        }
+      });
+
+      console.log('Fetched data:', output);
+
+      // Cache the data
+      await env.MY_BUCKET.put(uri, JSON.stringify({
+        uploaded: new Date(),
+        data: output
+      }));
+
+      return respond(output);
     }
-  }
+
+    // Return cached data
+    const data = await object.json();
+    return respond(data.data);
+  },
 }
