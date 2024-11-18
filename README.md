@@ -181,12 +181,6 @@ cd yield-backend
 npm install
 ```
 
-3. Configure environment variables
-```bash
-cp wrangler.example.toml wrangler.toml
-# Edit wrangler.toml with your Cloudflare configuration
-```
-
 ### Development Server
 
 Run the development server:

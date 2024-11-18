@@ -2,12 +2,13 @@
   "name": "yield-backend",
   "version": "0.0.0",
   "private": true,
+  "type": "module",
   "scripts": {
     "deploy": "wrangler deploy",
     "dev": "wrangler dev",
     "start": "wrangler dev",
-    "test": "vitest",
-    "test:coverage": "vitest run --coverage",
+    "test": "vitest -c vitest.config.mts",
+    "test:coverage": "vitest run --coverage -c vitest.config.mts",
     "cf-typegen": "wrangler types"
   },
   "devDependencies": {
@@ -19,6 +20,6 @@
     "wrangler": "^3.60.3"
   },
   "dependencies": {
-    "@moonwell-fi/moonwell-sdk": "^0.5.9"
+    "@moonwell-fi/moonwell-sdk": "^2.0.0"
   }
 }
