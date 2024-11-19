@@ -1,11 +1,11 @@
 # Moonwell Yield Backend
 
-A Cloudflare Worker that provides real-time market and vault information for the Moonwell protocol on Base chain. This service fetches data from Moonwell's smart contracts using the moonwell-sdk, processes it, and caches the results in Cloudflare R2 for efficient access.
+A Cloudflare Worker that provides real-time market and vault information for the Moonwell protocol on Base. This service fetches data from Moonwell's smart contracts using the Moonwell-SDK, processes it, and caches the results in Cloudflare R2 for efficient access.
 
 ## Features
 
-- Real-time market and vault data from Moonwell protocol
-- Comprehensive yield information including APY/APR
+- Real-time market and vault data from the Moonwell protocol
+- Comprehensive yield information including APY/APRs
 - Data caching with Cloudflare R2
 - Modular code structure with TypeScript
 - CORS-enabled API endpoint
