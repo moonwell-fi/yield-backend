@@ -29,6 +29,7 @@ const respond = (response: Record<string, unknown>, code: number = 200): Respons
 
 export interface Env {
   MY_BUCKET: R2Bucket;
+  BASE_RPC_URL: string;
 }
 
 export default {
@@ -48,7 +49,7 @@ export default {
       const moonwellClient = createMoonwellClient({
         networks: {
           base: {
-            rpcUrls: ["https://base.llamarpc.com"],
+            rpcUrls: [env.BASE_RPC_URL],
           },
         },
       });
@@ -93,7 +94,7 @@ export default {
     }
 
     // Return cached data
-    const data = await object.json();
+    const data = await object.json() as { data: Record<string, unknown> };
     return respond(data.data);
   },
 }
