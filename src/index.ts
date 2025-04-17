@@ -43,8 +43,8 @@ export default {
 
     if (
       (object === null) ||
-      (object.uploaded.getTime() < (Date.now()) - (10000))
-    ) { // Cached object is not found or older than 10 seconds
+      (object.uploaded.getTime() < (Date.now()) - (180000))
+    ) { // Cached object is not found or older than 180 seconds/3 minutes
       console.log('Cache miss, fetching new data...')
       const moonwellClient = createMoonwellClient({
         networks: {
