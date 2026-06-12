@@ -128,6 +128,72 @@ describe('serializeVault', () => {
     expect(result).toEqual(expectedResult);
   });
 
+  it('should fold WELL staking rewards into rewards, rewardsApy and totalApy', () => {
+    // Regression for MOO-391: cbBTC WELL rewards are distributed via the
+    // multi-reward staking distributor, surfaced by the SDK as `stakingRewards`
+    // / `stakingRewardsApr`. They must be included so the API reports the full
+    // reward APY instead of base APY only.
+    const wellToken: TokenConfig = { ...mockToken, address: '0xWELL', symbol: 'WELL' };
+    const vault: Partial<MorphoVault> = {
+      vaultKey: 'CBBTC-VAULT',
+      vaultToken: mockToken,
+      underlyingToken: mockToken,
+      baseApy: 0.0192,
+      rewardsApy: 0,
+      totalApy: 0.0192,
+      rewards: [],
+      stakingRewardsApr: 0.77,
+      stakingRewards: [{ apr: 0.77, token: wellToken }]
+    };
+
+    const result = serializeVault(vault);
+    expect(result?.rewardsApy).toBeCloseTo(0.77);
+    expect(result?.totalApy).toBeCloseTo(0.7892);
+    expect(result?.baseApy).toBe(0.0192);
+    expect(result?.rewards).toEqual([{
+      asset: { address: '0xWELL', name: 'Test Token', symbol: 'WELL', decimals: 18 },
+      supplyApr: 0.77,
+      supplyAmount: 0,
+      borrowApr: 0,
+      borrowAmount: 0
+    }]);
+  });
+
+  it('should combine Morpho-native rewards with staking rewards', () => {
+    const wellToken: TokenConfig = { ...mockToken, address: '0xWELL', symbol: 'WELL' };
+    const vault: Partial<MorphoVault> = {
+      vaultKey: 'COMBINED-VAULT',
+      baseApy: 0.02,
+      rewardsApy: 0.01,
+      totalApy: 0.03,
+      rewards: [mockReward],
+      stakingRewardsApr: 0.05,
+      stakingRewards: [{ apr: 0.05, token: wellToken }]
+    };
+
+    const result = serializeVault(vault);
+    expect(result?.rewardsApy).toBeCloseTo(0.06);
+    expect(result?.totalApy).toBeCloseTo(0.08);
+    expect(result?.rewards).toHaveLength(2);
+    expect(result?.rewards[1].asset.symbol).toBe('WELL');
+    expect(result?.rewards[1].supplyApr).toBe(0.05);
+  });
+
+  it('should not change rewards when no staking rewards are present', () => {
+    const vault: Partial<MorphoVault> = {
+      vaultKey: 'NO-STAKING-VAULT',
+      baseApy: 0.03,
+      rewardsApy: 0.02,
+      totalApy: 0.05,
+      rewards: [mockReward]
+    };
+
+    const result = serializeVault(vault);
+    expect(result?.rewardsApy).toBe(0.02);
+    expect(result?.totalApy).toBe(0.05);
+    expect(result?.rewards).toHaveLength(1);
+  });
+
   it('should handle invalid numeric values', () => {
     const invalidVault: Partial<MorphoVault> = {
       vaultKey: 'TEST-VAULT',

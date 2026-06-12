@@ -1,4 +1,4 @@
-import type { MorphoVault, MorphoVaultMarket, MorphoReward } from '@moonwell-fi/moonwell-sdk';
+import type { MorphoVault, MorphoVaultMarket, MorphoReward, MorphoStakingReward } from '@moonwell-fi/moonwell-sdk';
 import { serializeAmount } from './amount';
 import { serializeToken, type SerializedToken } from './token';
 
@@ -59,6 +59,35 @@ export const serializeVault = (vault: Partial<MorphoVault> | null | undefined): 
     return Array.isArray(val) ? val : [];
   };
 
+  // WELL rewards on Moonwell's Morpho vaults are distributed through the
+  // multi-reward staking distributor, which the SDK surfaces as `stakingRewards`
+  // / `stakingRewardsApr` — separate from the Morpho-native `rewards` /
+  // `rewardsApy`. Fold the staking rewards into the reward fields so consumers
+  // see the full reward APY (e.g. cbBTC's ~0.77% WELL rewards) instead of base
+  // APY only.
+  const stakingRewardsApr = toNumber(vault.stakingRewardsApr);
+
+  const rewards = [
+    ...toArray<Partial<MorphoReward>>(vault.rewards).map((reward) => ({
+      asset: serializeToken(reward.asset) || {
+        address: '', name: '', symbol: '', decimals: 0
+      },
+      supplyApr: toNumber(reward.supplyApr),
+      supplyAmount: toNumber(reward.supplyAmount),
+      borrowApr: toNumber(reward.borrowApr),
+      borrowAmount: toNumber(reward.borrowAmount)
+    })),
+    ...toArray<Partial<MorphoStakingReward>>(vault.stakingRewards).map((stakingReward) => ({
+      asset: serializeToken(stakingReward.token) || {
+        address: '', name: '', symbol: '', decimals: 0
+      },
+      supplyApr: toNumber(stakingReward.apr),
+      supplyAmount: 0,
+      borrowApr: 0,
+      borrowAmount: 0
+    }))
+  ];
+
   return {
     // Basic vault info
     vaultKey: vault.vaultKey || '',
@@ -72,10 +101,10 @@ export const serializeVault = (vault: Partial<MorphoVault> | null | undefined): 
     },
     underlyingPrice: toNumber(vault.underlyingPrice),
 
-    // APY info
+    // APY info (rewards/total include WELL staking rewards, see above)
     baseApy: toNumber(vault.baseApy),
-    totalApy: toNumber(vault.totalApy),
-    rewardsApy: toNumber(vault.rewardsApy),
+    totalApy: toNumber(vault.totalApy) + stakingRewardsApr,
+    rewardsApy: toNumber(vault.rewardsApy) + stakingRewardsApr,
 
     // Configuration
     curators: toArray(vault.curators),
@@ -112,15 +141,7 @@ export const serializeVault = (vault: Partial<MorphoVault> | null | undefined): 
       }))
     })),
 
-    // Rewards
-    rewards: (vault.rewards || []).map((reward: Partial<MorphoReward>) => ({
-      asset: serializeToken(reward.asset) || { 
-        address: '', name: '', symbol: '', decimals: 0
-      },
-      supplyApr: toNumber(reward.supplyApr),
-      supplyAmount: toNumber(reward.supplyAmount),
-      borrowApr: toNumber(reward.borrowApr),
-      borrowAmount: toNumber(reward.borrowAmount)
-    }))
+    // Rewards (Morpho-native rewards plus WELL staking rewards)
+    rewards
   };
 };
