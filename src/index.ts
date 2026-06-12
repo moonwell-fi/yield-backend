@@ -35,6 +35,18 @@ const logEvent = (event: string, details: Record<string, unknown> = {}): void =>
   }));
 };
 
+// The public API keeps its original vault keys. Newer SDK versions repointed
+// those keys to the new V2 wrapper vaults and renamed the original V1 vaults
+// to `*v1` (e.g. `mwcbBTC` -> V2, `mwcbBTCv1` -> the vault this API has always
+// served), so we serve the V1 vaults under their legacy keys and drop the rest.
+const LEGACY_VAULT_KEYS: Record<string, string> = {
+  mwETHv1: 'mwETH',
+  mwUSDCv1: 'mwUSDC',
+  mwEURCv1: 'mwEURC',
+  mwcbBTCv1: 'mwcbBTC',
+  meUSDCv1: 'meUSDC',
+};
+
 const cacheAgeBucket = (ageMs: number | null): string => {
   if (ageMs === null || Number.isNaN(ageMs)) return 'unknown';
   if (ageMs < 60_000) return 'lt_1m';
@@ -114,12 +126,23 @@ export default {
           }
         });
 
-        // Serialize vaults
+        // Serialize vaults under their legacy keys
         vaults.forEach(vault => {
           const serializedVault = serializeVault(vault);
-          if (serializedVault && serializedVault.vaultKey) {
-            output.vaults[serializedVault.vaultKey] = serializedVault;
-          }
+          if (!serializedVault || !serializedVault.vaultKey) return;
+          const legacyKey = LEGACY_VAULT_KEYS[serializedVault.vaultKey];
+          if (!legacyKey) return;
+          output.vaults[legacyKey] = {
+            ...serializedVault,
+            vaultKey: legacyKey,
+            vaultToken: {
+              ...serializedVault.vaultToken,
+              // Restore the on-chain token labels (the SDK renamed its V1
+              // config entries to "... V1" / "*v1" when V2 was introduced)
+              symbol: legacyKey,
+              name: serializedVault.vaultToken.name.replace(/ V1$/, ''),
+            },
+          };
         });
 
         console.log('Successfully fetched fresh data');
