@@ -15,14 +15,13 @@ export const LEGACY_VAULT_KEYS: Record<string, string> = {
 
 // Map the serialized SDK vaults onto the legacy public API keys.
 //
-// The SDK's Lunar path routes V2 deposits through the underlying V1 vault, so
-// it substitutes the V1 vault's TVL into the V2 wrapper but keeps the reward
-// and APY data — including the WELL rewards — on the V2 wrapper. Because we
-// serve the V1 vault under the legacy key, its `rewardsApy`/`rewards` are empty
-// and the API reports the base APY only (MOO-501, a recurrence of MOO-391 for
-// cbBTC). Overlay the paired V2 wrapper's APY/reward fields onto the served V1
-// vault so the full reward APY is reported, while keeping V1's TVL, token
-// address and identity unchanged.
+// We serve the V1 vault (which holds the real TVL) under its legacy key and
+// keep its own `baseApy`/`totalApy`. We deliberately do NOT overlay APY/reward
+// fields from the paired V2 wrapper: recent SDK versions return the wrapper with
+// all-zero APY and empty rewards, so overlaying it wiped out the served vault's
+// real base APY (MOO-501). WELL reward APY is no longer exposed on either the V1
+// vault or the V2 wrapper by the SDK; it is fetched separately from the Morpho
+// Blue API and overlaid downstream (see fetchVaultRewards / index.ts).
 export const mapVaultsToLegacyKeys = (
   serializedVaults: (SerializedVault | null)[],
 ): Record<string, SerializedVault> => {
@@ -35,20 +34,8 @@ export const mapVaultsToLegacyKeys = (
   for (const [v1Key, legacyKey] of Object.entries(LEGACY_VAULT_KEYS)) {
     const v1Vault = byKey.get(v1Key);
     if (!v1Vault) continue;
-    // The V2 wrapper vault is keyed by the legacy key (e.g. `mwcbBTC`).
-    const v2Vault = byKey.get(legacyKey);
     output[legacyKey] = {
       ...v1Vault,
-      // Reward/APY fields come from the V2 wrapper, which carries the WELL
-      // rewards; fall back to the V1 values if the wrapper is unavailable.
-      ...(v2Vault
-        ? {
-            baseApy: v2Vault.baseApy,
-            rewardsApy: v2Vault.rewardsApy,
-            totalApy: v2Vault.totalApy,
-            rewards: v2Vault.rewards,
-          }
-        : {}),
       vaultKey: legacyKey,
       vaultToken: {
         ...v1Vault.vaultToken,

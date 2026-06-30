@@ -3,6 +3,7 @@ import type { ExecutionContext } from '@cloudflare/workers-types';
 import { serializeMarket } from './serializers/market';
 import { serializeVault } from './serializers/vault';
 import { mapVaultsToLegacyKeys } from './serializers/legacyVaults';
+import { fetchVaultRewards } from './serializers/vaultRewards';
 
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
@@ -115,10 +116,28 @@ export default {
           }
         });
 
-        // Serialize vaults and remap them onto the legacy public API keys,
-        // folding the WELL reward APY from each V2 wrapper into the V1 vault we
-        // serve (see mapVaultsToLegacyKeys).
+        // Serialize vaults and remap them onto the legacy public API keys
+        // (keeps each V1 vault's TVL and base APY; see mapVaultsToLegacyKeys).
         output.vaults = mapVaultsToLegacyKeys(vaults.map(serializeVault));
+
+        // The SDK no longer exposes WELL reward APY on the vault objects, so
+        // fetch it from the Morpho Blue API and overlay it onto the served
+        // vaults. Failures degrade to base-APY-only (fetchVaultRewards never
+        // throws and returns an empty map), so this never blocks the response.
+        const vaultEntries = Object.values(output.vaults).filter(
+          (vault): vault is { vaultToken: { address: string }; baseApy: number } & Record<string, unknown> =>
+            typeof vault?.vaultToken?.address === 'string',
+        );
+        const vaultRewardsByAddress = await fetchVaultRewards(
+          vaultEntries.map((vault) => vault.vaultToken.address),
+        );
+        for (const vault of vaultEntries) {
+          const overlay = vaultRewardsByAddress.get(vault.vaultToken.address.toLowerCase());
+          if (!overlay) continue;
+          vault.rewards = overlay.rewards;
+          vault.rewardsApy = overlay.rewardsApy;
+          vault.totalApy = vault.baseApy + overlay.rewardsApy;
+        }
 
         console.log('Successfully fetched fresh data');
         logEvent('upstream_success', { uri });
