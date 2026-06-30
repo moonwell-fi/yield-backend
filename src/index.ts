@@ -2,6 +2,7 @@ import { createMoonwellClient } from '@moonwell-fi/moonwell-sdk';
 import type { ExecutionContext } from '@cloudflare/workers-types';
 import { serializeMarket } from './serializers/market';
 import { serializeVault } from './serializers/vault';
+import { mapVaultsToLegacyKeys } from './serializers/legacyVaults';
 
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
@@ -33,18 +34,6 @@ const logEvent = (event: string, details: Record<string, unknown> = {}): void =>
     ts: new Date().toISOString(),
     ...details,
   }));
-};
-
-// The public API keeps its original vault keys. Newer SDK versions repointed
-// those keys to the new V2 wrapper vaults and renamed the original V1 vaults
-// to `*v1` (e.g. `mwcbBTC` -> V2, `mwcbBTCv1` -> the vault this API has always
-// served), so we serve the V1 vaults under their legacy keys and drop the rest.
-const LEGACY_VAULT_KEYS: Record<string, string> = {
-  mwETHv1: 'mwETH',
-  mwUSDCv1: 'mwUSDC',
-  mwEURCv1: 'mwEURC',
-  mwcbBTCv1: 'mwcbBTC',
-  meUSDCv1: 'meUSDC',
 };
 
 const cacheAgeBucket = (ageMs: number | null): string => {
@@ -126,24 +115,10 @@ export default {
           }
         });
 
-        // Serialize vaults under their legacy keys
-        vaults.forEach(vault => {
-          const serializedVault = serializeVault(vault);
-          if (!serializedVault || !serializedVault.vaultKey) return;
-          const legacyKey = LEGACY_VAULT_KEYS[serializedVault.vaultKey];
-          if (!legacyKey) return;
-          output.vaults[legacyKey] = {
-            ...serializedVault,
-            vaultKey: legacyKey,
-            vaultToken: {
-              ...serializedVault.vaultToken,
-              // Restore the on-chain token labels (the SDK renamed its V1
-              // config entries to "... V1" / "*v1" when V2 was introduced)
-              symbol: legacyKey,
-              name: serializedVault.vaultToken.name.replace(/ V1$/, ''),
-            },
-          };
-        });
+        // Serialize vaults and remap them onto the legacy public API keys,
+        // folding the WELL reward APY from each V2 wrapper into the V1 vault we
+        // serve (see mapVaultsToLegacyKeys).
+        output.vaults = mapVaultsToLegacyKeys(vaults.map(serializeVault));
 
         console.log('Successfully fetched fresh data');
         logEvent('upstream_success', { uri });
