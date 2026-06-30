@@ -41,19 +41,23 @@ const RewardSchema = z.object({
   }),
 });
 
+// Validate the response per-item rather than as one strict schema. `allRewards`
+// includes forwarded rewards whose shape can vary, and a single malformed entry
+// must not drop rewards for every other vault — so the outer shape stays loose
+// and each vault / reward is parsed and skipped individually below.
+const VaultItemSchema = z.object({
+  address: z.string(),
+  state: z
+    .object({
+      allRewards: z.array(z.unknown()),
+    })
+    .nullable(),
+});
+
 const VaultRewardsResponseSchema = z.object({
   data: z.object({
     vaults: z.object({
-      items: z.array(
-        z.object({
-          address: z.string(),
-          state: z
-            .object({
-              allRewards: z.array(RewardSchema),
-            })
-            .nullable(),
-        }),
-      ),
+      items: z.array(z.unknown()),
     }),
   }),
 });
@@ -102,25 +106,35 @@ export const fetchVaultRewards = async (
       return result;
     }
 
-    for (const vault of parsed.data.data.vaults.items) {
-      if (!vault.state) continue;
+    for (const rawVault of parsed.data.data.vaults.items) {
+      // Skip a vault whose envelope is malformed rather than dropping every
+      // other vault's rewards.
+      const vault = VaultItemSchema.safeParse(rawVault);
+      if (!vault.success || !vault.data.state) continue;
 
-      const rewards: SerializedVault['rewards'] = vault.state.allRewards.map((reward) => ({
-        asset: {
-          address: reward.asset.address,
-          name: reward.asset.symbol,
-          symbol: reward.asset.symbol,
-          decimals: reward.asset.decimals,
-        },
-        // Scale decimal APR -> percentage to match baseApy/totalApy units.
-        supplyApr: reward.supplyApr * 100,
-        supplyAmount: 0,
-        borrowApr: 0,
-        borrowAmount: 0,
-      }));
+      const rewards: SerializedVault['rewards'] = [];
+      for (const rawReward of vault.data.state.allRewards) {
+        // Forwarded rewards can carry an unexpected shape; skip the bad entry
+        // instead of discarding the whole vault's rewards.
+        const reward = RewardSchema.safeParse(rawReward);
+        if (!reward.success) continue;
+        rewards.push({
+          asset: {
+            address: reward.data.asset.address,
+            name: reward.data.asset.symbol,
+            symbol: reward.data.asset.symbol,
+            decimals: reward.data.asset.decimals,
+          },
+          // Scale decimal APR -> percentage to match baseApy/totalApy units.
+          supplyApr: reward.data.supplyApr * 100,
+          supplyAmount: 0,
+          borrowApr: 0,
+          borrowAmount: 0,
+        });
+      }
 
       const rewardsApy = rewards.reduce((sum, reward) => sum + reward.supplyApr, 0);
-      result.set(vault.address.toLowerCase(), { rewards, rewardsApy });
+      result.set(vault.data.address.toLowerCase(), { rewards, rewardsApy });
     }
   } catch (error) {
     console.error('[morpho-api] vault rewards fetch threw:', error);

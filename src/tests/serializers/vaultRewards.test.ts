@@ -87,4 +87,54 @@ describe('fetchVaultRewards', () => {
     const result = await fetchVaultRewards([ADDRESS]);
     expect(result.size).toBe(0);
   });
+
+  it('skips a malformed reward but keeps the valid rewards on the same vault', async () => {
+    mockFetch(() => ({
+      data: {
+        vaults: {
+          items: [
+            {
+              address: ADDRESS,
+              state: {
+                allRewards: [
+                  { supplyApr: null, asset: { address: '0xBAD', symbol: 'BAD', decimals: 18 } },
+                  { supplyApr: 0.01, asset: { address: '0xWELL', symbol: 'WELL', decimals: 18 } },
+                ],
+              },
+            },
+          ],
+        },
+      },
+    }));
+
+    const overlay = (await fetchVaultRewards([ADDRESS])).get(ADDRESS.toLowerCase());
+    expect(overlay?.rewards).toHaveLength(1);
+    expect(overlay?.rewards[0].asset.symbol).toBe('WELL');
+    expect(overlay?.rewardsApy).toBeCloseTo(1, 5);
+  });
+
+  it('skips a malformed vault but keeps other vaults', async () => {
+    const OTHER = '0x0000000000000000000000000000000000000002';
+    mockFetch(() => ({
+      data: {
+        vaults: {
+          items: [
+            { address: 12345, state: { allRewards: [] } }, // bad: non-string address
+            {
+              address: OTHER,
+              state: {
+                allRewards: [
+                  { supplyApr: 0.02, asset: { address: '0xWELL', symbol: 'WELL', decimals: 18 } },
+                ],
+              },
+            },
+          ],
+        },
+      },
+    }));
+
+    const result = await fetchVaultRewards([ADDRESS, OTHER]);
+    expect(result.has(OTHER.toLowerCase())).toBe(true);
+    expect(result.get(OTHER.toLowerCase())?.rewardsApy).toBeCloseTo(2, 5);
+  });
 });
