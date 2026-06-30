@@ -23,17 +23,11 @@ const makeVault = (overrides: Partial<SerializedVault>): SerializedVault => ({
   ...overrides,
 });
 
-const wellReward = {
-  asset: { address: '0xWELL', name: 'WELL', symbol: 'WELL', decimals: 18 },
-  supplyApr: 0.77,
-  supplyAmount: 0,
-  borrowApr: 0,
-  borrowAmount: 0,
-};
-
 describe('mapVaultsToLegacyKeys', () => {
-  it('overlays the V2 wrapper reward/APY fields onto the served V1 vault (MOO-501)', () => {
-    // V1 holds the TVL but no rewards; the WELL reward APY lives on the V2 wrapper.
+  it('keeps the served V1 vault base APY and never overlays the V2 wrapper (MOO-501)', () => {
+    // The SDK returns the V2 wrapper with all-zero APY and empty rewards.
+    // Overlaying it used to wipe out the served vault's real base APY; the
+    // remap must now leave the V1 values untouched.
     const v1 = makeVault({
       vaultKey: 'mwcbBTCv1',
       vaultToken: { address: '0xV1', name: 'Moonwell Frontier cbBTC V1', symbol: 'mwcbBTCv1', decimals: 18 },
@@ -46,10 +40,10 @@ describe('mapVaultsToLegacyKeys', () => {
     const v2 = makeVault({
       vaultKey: 'mwcbBTC',
       vaultToken: { address: '0xV2', name: 'Moonwell Frontier cbBTC', symbol: 'mwcbBTC', decimals: 18 },
-      baseApy: 0.0192,
-      rewardsApy: 0.77,
-      totalApy: 0.7892,
-      rewards: [wellReward],
+      baseApy: 0,
+      rewardsApy: 0,
+      totalApy: 0,
+      rewards: [],
       totalSupplyUsd: 13, // V2 only holds idle assets
     });
 
@@ -57,12 +51,10 @@ describe('mapVaultsToLegacyKeys', () => {
 
     expect(Object.keys(result)).toEqual(['mwcbBTC']);
     const served = result.mwcbBTC;
-    // Reward/APY fields come from V2 ...
+    // APY fields stay with V1 — the all-zero wrapper must not clobber them.
     expect(served.baseApy).toBeCloseTo(0.0192);
-    expect(served.rewardsApy).toBeCloseTo(0.77);
-    expect(served.totalApy).toBeCloseTo(0.7892);
-    expect(served.rewards).toEqual([wellReward]);
-    // ... while TVL and token identity stay with V1.
+    expect(served.totalApy).toBeCloseTo(0.0192);
+    // TVL and token identity stay with V1.
     expect(served.totalSupplyUsd).toBe(5_000_000);
     expect(served.vaultToken.address).toBe('0xV1');
     expect(served.vaultKey).toBe('mwcbBTC');
@@ -71,21 +63,20 @@ describe('mapVaultsToLegacyKeys', () => {
     expect(served.vaultToken.name).toBe('Moonwell Frontier cbBTC');
   });
 
-  it('falls back to the V1 vault values when no V2 wrapper is present', () => {
+  it('serves the V1 vault values under the legacy key', () => {
     const v1 = makeVault({
       vaultKey: 'mwETHv1',
       vaultToken: { address: '0xV1', name: 'Moonwell Flagship ETH V1', symbol: 'mwETHv1', decimals: 18 },
       baseApy: 0.03,
-      rewardsApy: 0.01,
-      totalApy: 0.04,
-      rewards: [wellReward],
+      rewardsApy: 0,
+      totalApy: 0.03,
+      rewards: [],
     });
 
     const result = mapVaultsToLegacyKeys([v1]);
 
-    expect(result.mwETH.rewardsApy).toBe(0.01);
-    expect(result.mwETH.totalApy).toBe(0.04);
-    expect(result.mwETH.rewards).toEqual([wellReward]);
+    expect(result.mwETH.baseApy).toBe(0.03);
+    expect(result.mwETH.totalApy).toBe(0.03);
     expect(result.mwETH.vaultToken.symbol).toBe('mwETH');
     expect(result.mwETH.vaultToken.name).toBe('Moonwell Flagship ETH');
   });
