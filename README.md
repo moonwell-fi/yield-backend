@@ -9,6 +9,7 @@ A Cloudflare Worker that provides real-time market and vault information for the
 - Data caching with Cloudflare R2
 - Modular code structure with TypeScript
 - CORS-enabled API endpoint
+- Sentry error reporting and performance tracing for R2, Moonwell RPC, and Morpho API calls
 
 ## API
 
@@ -200,3 +201,10 @@ npm test
 Deploy to Cloudflare Workers:
 ```bash
 npm run deploy
+```
+
+The production Sentry DSN is configured in `wrangler.toml`. Ten percent of
+requests are performance-traced; handled upstream and cache failures are
+reported with low-cardinality component and operation tags. Each event is tied
+to the deployed Cloudflare Worker version, and Cloudflare source maps are
+uploaded for readable Worker log stack traces.

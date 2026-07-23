@@ -1,13 +1,16 @@
+import * as Sentry from '@sentry/cloudflare';
 import { createMoonwellClient } from '@moonwell-fi/moonwell-sdk';
 import type { ExecutionContext } from '@cloudflare/workers-types';
 import { serializeMarket } from './serializers/market';
 import { serializeVault } from './serializers/vault';
 import { mapVaultsToLegacyKeys } from './serializers/legacyVaults';
 import { fetchVaultRewards } from './serializers/vaultRewards';
+import { createSentryOptions } from './sentry';
 
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Methods': 'GET,HEAD,POST,OPTIONS',
+  'Access-Control-Allow-Headers': 'content-type,sentry-trace,baggage',
   'Access-Control-Max-Age': '86400',
   'content-type': 'application/json'
 }
@@ -51,9 +54,13 @@ const cacheAgeBucket = (ageMs: number | null): string => {
 export interface Env {
   MY_BUCKET: R2Bucket;
   BASE_RPC_URL: string;
+  SENTRY_DSN?: string;
+  SENTRY_ENVIRONMENT?: string;
+  SENTRY_RELEASE?: string;
+  CF_VERSION_METADATA: WorkerVersionMetadata;
 }
 
-export default {
+const worker: ExportedHandler<Env> = {
   async fetch(
     request: Request,
     env: Env,
@@ -70,13 +77,23 @@ export default {
       } catch (error) {
         console.error('Failed to parse cached payload from R2:', error);
         logEvent('cache_parse_error', { uri });
+        Sentry.captureException(error, {
+          tags: {
+            component: 'r2',
+            operation: 'cache_parse',
+          },
+          extra: { uri },
+        });
       }
     }
 
     const cacheExists = cachedPayload !== null;
-    const cacheUploadedMs = cacheExists ? new Date(cachedPayload.uploaded).getTime() : 0;
+    const cacheUploadedMs = cachedPayload ? new Date(cachedPayload.uploaded).getTime() : 0;
     const cacheAgeMs = cacheExists ? (nowMs - cacheUploadedMs) : null;
     const cacheIsStale = cacheExists && (Number.isNaN(cacheUploadedMs) || cacheUploadedMs < (nowMs - 180000));
+    const cacheState = !cacheExists ? 'missing' : cacheIsStale ? 'stale' : 'fresh';
+    Sentry.setTag('cache_state', cacheState);
+    Sentry.setTag('cache_age_bucket', cacheAgeBucket(cacheAgeMs));
 
     if (!cacheExists || cacheIsStale) {
       // Cache is missing or older than 180 seconds/3 minutes
@@ -87,6 +104,7 @@ export default {
         cache_age_bucket: cacheAgeBucket(cacheAgeMs),
       });
       
+      let upstreamBranch = 'moonwell_markets';
       try {
         const moonwellClient = createMoonwellClient({
           networks: {
@@ -96,8 +114,16 @@ export default {
           },
         });
 
-        const markets = await moonwellClient.getMarkets({chainId: 8453});
-        const vaults = await moonwellClient.getMorphoVaults({includeRewards: true});
+        const markets = await Sentry.startSpan(
+          { name: 'Moonwell markets', op: 'upstream.moonwell.markets' },
+          () => moonwellClient.getMarkets({chainId: 8453}),
+        );
+        upstreamBranch = 'moonwell_morpho_vaults';
+        const vaults = await Sentry.startSpan(
+          { name: 'Moonwell Morpho vaults', op: 'upstream.moonwell.morpho_vaults' },
+          () => moonwellClient.getMorphoVaults({includeRewards: true}),
+        );
+        upstreamBranch = 'serialize_payload';
 
         // Create the output object
         const output: {
@@ -128,9 +154,14 @@ export default {
           (vault): vault is { vaultToken: { address: string }; baseApy: number } & Record<string, unknown> =>
             typeof vault?.vaultToken?.address === 'string',
         );
-        const vaultRewardsByAddress = await fetchVaultRewards(
-          vaultEntries.map((vault) => vault.vaultToken.address),
+        upstreamBranch = 'morpho_blue_vault_rewards';
+        const vaultRewardsByAddress = await Sentry.startSpan(
+          { name: 'Morpho Blue vault rewards', op: 'upstream.morpho_blue.vault_rewards' },
+          () => fetchVaultRewards(
+            vaultEntries.map((vault) => vault.vaultToken.address),
+          ),
         );
+        upstreamBranch = 'apply_vault_rewards';
         for (const vault of vaultEntries) {
           const overlay = vaultRewardsByAddress.get(vault.vaultToken.address.toLowerCase());
           if (!overlay) continue;
@@ -151,15 +182,31 @@ export default {
         } catch (error) {
           console.error('Failed to update cache in R2:', error);
           logEvent('cache_write_error', { uri });
+          Sentry.captureException(error, {
+            tags: {
+              component: 'r2',
+              operation: 'cache_write',
+            },
+            extra: { uri },
+          });
         }
 
+        Sentry.setTag('response_source', 'live');
         return respond(output);
       } catch (error) {
         // SDK request failed - try to return stale cached data as fallback
         console.error('SDK request failed:', error);
         logEvent('upstream_error', { uri });
+        Sentry.captureException(error, {
+          tags: {
+            component: 'upstream',
+            upstream_branch: upstreamBranch,
+            cache_available: String(cacheExists),
+          },
+          extra: { uri },
+        });
         
-        if (cacheExists) {
+        if (cachedPayload) {
           const cacheAge = Date.now() - new Date(cachedPayload.uploaded).getTime();
           console.log(`Returning stale cached data as fallback (age: ${Math.round(cacheAge / 1000)}s)`);
           logEvent('cache_fallback', {
@@ -167,12 +214,14 @@ export default {
             cache_age_ms: cacheAge,
             cache_age_bucket: cacheAgeBucket(cacheAge),
           });
+          Sentry.setTag('response_source', 'stale_cache');
           return respond(cachedPayload.data);
         }
         
         // No cached data available at all
         console.error('No cached data available for fallback');
         logEvent('cache_fallback_unavailable', { uri });
+        Sentry.setTag('response_source', 'unavailable');
         return respond({ error: 'Service temporarily unavailable', message: 'Unable to fetch data and no cached data available' }, 503);
       }
     }
@@ -184,6 +233,9 @@ export default {
       cache_age_ms: cacheAgeMs,
       cache_age_bucket: cacheAgeBucket(cacheAgeMs),
     });
-    return respond(cachedPayload.data);
+    Sentry.setTag('response_source', 'fresh_cache');
+    return respond(cachedPayload!.data);
   },
-}
+};
+
+export default Sentry.withSentry<Env>(createSentryOptions, worker);

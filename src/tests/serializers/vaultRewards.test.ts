@@ -1,5 +1,11 @@
+import * as Sentry from '@sentry/cloudflare';
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import { fetchVaultRewards } from '../../serializers/vaultRewards';
+
+vi.mock('@sentry/cloudflare', () => ({
+  captureException: vi.fn(),
+  captureMessage: vi.fn(),
+}));
 
 const ADDRESS = '0xC1256Ae5FF1cf2719D4937adb3bbCCab2E00A2Ca';
 
@@ -74,6 +80,12 @@ describe('fetchVaultRewards', () => {
     global.fetch = vi.fn().mockResolvedValue({ ok: false, status: 500 }) as unknown as typeof fetch;
     const result = await fetchVaultRewards([ADDRESS]);
     expect(result.size).toBe(0);
+    expect(Sentry.captureMessage).toHaveBeenCalledWith(
+      'Morpho Blue vault rewards request failed',
+      expect.objectContaining({
+        tags: expect.objectContaining({ http_status: '500' }),
+      }),
+    );
   });
 
   it('returns an empty map when the response shape is unexpected (no throw)', async () => {
@@ -83,9 +95,16 @@ describe('fetchVaultRewards', () => {
   });
 
   it('returns an empty map when fetch throws (no throw)', async () => {
-    global.fetch = vi.fn().mockRejectedValue(new Error('network')) as unknown as typeof fetch;
+    const error = new Error('network');
+    global.fetch = vi.fn().mockRejectedValue(error) as unknown as typeof fetch;
     const result = await fetchVaultRewards([ADDRESS]);
     expect(result.size).toBe(0);
+    expect(Sentry.captureException).toHaveBeenCalledWith(
+      error,
+      expect.objectContaining({
+        tags: expect.objectContaining({ operation: 'vault_rewards' }),
+      }),
+    );
   });
 
   it('skips a malformed reward but keeps the valid rewards on the same vault', async () => {
