@@ -20,6 +20,7 @@
     "wrangler": "^3.103.2"
   },
   "dependencies": {
-    "@moonwell-fi/moonwell-sdk": "^0.20.1"
+    "@moonwell-fi/moonwell-sdk": "^0.20.1",
+    "@sentry/cloudflare": "^10.67.0"
   }
 }

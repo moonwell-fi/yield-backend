@@ -1,3 +1,4 @@
+import * as Sentry from '@sentry/cloudflare';
 import { z } from 'zod';
 import type { SerializedVault } from './vault';
 
@@ -97,12 +98,34 @@ export const fetchVaultRewards = async (
 
     if (!response.ok) {
       console.error(`[morpho-api] vault rewards fetch failed: ${response.status}`);
+      Sentry.captureMessage('Morpho Blue vault rewards request failed', {
+        level: 'warning',
+        tags: {
+          component: 'morpho_blue',
+          operation: 'vault_rewards',
+          http_status: String(response.status),
+        },
+        extra: {
+          chainId,
+          vaultCount: vaultAddresses.length,
+        },
+      });
       return result;
     }
 
     const parsed = VaultRewardsResponseSchema.safeParse(await response.json());
     if (!parsed.success) {
       console.error('[morpho-api] vault rewards parse failed:', parsed.error);
+      Sentry.captureException(parsed.error, {
+        tags: {
+          component: 'morpho_blue',
+          operation: 'vault_rewards_parse',
+        },
+        extra: {
+          chainId,
+          vaultCount: vaultAddresses.length,
+        },
+      });
       return result;
     }
 
@@ -138,6 +161,16 @@ export const fetchVaultRewards = async (
     }
   } catch (error) {
     console.error('[morpho-api] vault rewards fetch threw:', error);
+    Sentry.captureException(error, {
+      tags: {
+        component: 'morpho_blue',
+        operation: 'vault_rewards',
+      },
+      extra: {
+        chainId,
+        vaultCount: vaultAddresses.length,
+      },
+    });
   }
 
   return result;
