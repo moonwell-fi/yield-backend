@@ -17,22 +17,28 @@ const corsHeaders = {
 }
 
 interface ResponseMeta {
-  uploaded: string;
+  uploaded: string | null;
   stale: boolean;
   cacheStatus: 'live' | 'fresh' | 'stale';
-  ageSeconds: number;
+  // null = the blob's timestamp is missing/unusable; the Age header is omitted
+  // rather than reporting a nonsense value.
+  ageSeconds: number | null;
 }
 
 const respond = (response: Record<string, unknown>, code: number = 200, meta?: ResponseMeta): Response => {
   const body = JSON.stringify(
-    meta ? { uploaded: meta.uploaded, stale: meta.stale, ...response } : response,
+    meta ? { uploaded: meta.uploaded ?? null, stale: meta.stale, ...response } : response,
     null,
     2,
   );
   const init = {
     status: code,
     headers: meta
-      ? { ...corsHeaders, 'Age': String(meta.ageSeconds), 'X-Cache-Status': meta.cacheStatus }
+      ? {
+          ...corsHeaders,
+          ...(meta.ageSeconds === null ? {} : { 'Age': String(meta.ageSeconds) }),
+          'X-Cache-Status': meta.cacheStatus,
+        }
       : corsHeaders,
     statusText: code === 200 ? 'OK' : 'Error'
   };
@@ -75,11 +81,14 @@ const readCachedPayload = async (env: Env): Promise<CachedPayload | null> => {
   return parseCachedPayload(object);
 };
 
-const cacheAgeMs = (payload: CachedPayload | null, nowMs: number): number => {
+// null = no cache or an unusable timestamp. Callers treat null as maximally
+// stale for decisions, but must not leak a fabricated age into headers or logs.
+const cacheAgeMs = (payload: CachedPayload | null, nowMs: number): number | null => {
   const uploadedMs = payload ? new Date(payload.uploaded).getTime() : Number.NaN;
-  // No cache, or an unparseable timestamp, counts as maximally stale rather than fresh.
-  return Number.isNaN(uploadedMs) ? Number.MAX_SAFE_INTEGER : Math.max(0, nowMs - uploadedMs);
+  return Number.isNaN(uploadedMs) ? null : Math.max(0, nowMs - uploadedMs);
 };
+
+const effectiveAgeMs = (ageMs: number | null): number => ageMs ?? Number.MAX_SAFE_INTEGER;
 
 // Fixed messages so Sentry issue grouping (and the dashboard alert rules in the
 // README) stay stable across both handlers.
@@ -104,10 +113,31 @@ const captureStaleness = (ageMs: number): void => {
 const STALE_ALERT_THROTTLE_MS = 5 * 60_000;
 export const staleAlertState = { lastAlertMs: 0 };
 
-const captureStalenessThrottled = (ageMs: number, nowMs: number): void => {
+// The isolate throttle alone multiplies by isolate/colo count during an
+// incident; layer a colo-wide marker in the Cache API on top so each colo emits
+// at most one event per window. (Unavailable outside workerd — e.g. in tests —
+// where the isolate throttle still applies.)
+const STALE_ALERT_MARKER_URL = 'https://yield-backend.internal/stale-alert-marker';
+
+const staleAlertMarkerHeld = async (): Promise<boolean> => {
+  try {
+    const cache = (globalThis as { caches?: { default?: Cache } }).caches?.default;
+    if (!cache) return false;
+    if (await cache.match(STALE_ALERT_MARKER_URL)) return true;
+    await cache.put(STALE_ALERT_MARKER_URL, new Response('held', {
+      headers: { 'Cache-Control': `max-age=${Math.floor(STALE_ALERT_THROTTLE_MS / 1000)}` },
+    }));
+    return false;
+  } catch {
+    return false;
+  }
+};
+
+const captureStalenessThrottled = async (ageMs: number, nowMs: number): Promise<void> => {
   if (ageMs <= STALE_WARNING_AGE_MS) return;
   if (staleAlertState.lastAlertMs && nowMs - staleAlertState.lastAlertMs < STALE_ALERT_THROTTLE_MS) return;
   staleAlertState.lastAlertMs = nowMs;
+  if (await staleAlertMarkerHeld()) return;
   captureStaleness(ageMs);
 };
 
@@ -163,11 +193,11 @@ export const worker: ExportedHandler<Env> = {
 
     if (cachedPayload) {
       const ageMs = cacheAgeMs(cachedPayload, nowMs);
-      const stale = ageMs >= CACHE_TTL_MS;
+      const stale = effectiveAgeMs(ageMs) >= CACHE_TTL_MS;
       Sentry.setTag('cache_state', stale ? 'stale' : 'fresh');
       Sentry.setTag('cache_age_bucket', cacheAgeBucket(ageMs));
 
-      if (stale && shouldHardFail(ageMs)) {
+      if (stale && shouldHardFail(effectiveAgeMs(ageMs))) {
         logEvent('cache_too_stale', { uri: CACHE_URI, cache_age_ms: ageMs });
         Sentry.setTag('response_source', 'unavailable');
         return respond({ error: 'Service temporarily unavailable', message: 'Cached data exceeded the maximum stale age' }, 503);
@@ -179,12 +209,12 @@ export const worker: ExportedHandler<Env> = {
         cache_age_bucket: cacheAgeBucket(ageMs),
       });
       Sentry.setTag('response_source', stale ? 'stale_cache' : 'fresh_cache');
-      if (stale) captureStalenessThrottled(ageMs, nowMs);
+      if (stale) await captureStalenessThrottled(effectiveAgeMs(ageMs), nowMs);
       return respond(cachedPayload.data, 200, {
-        uploaded: cachedPayload.uploaded,
+        uploaded: cachedPayload.uploaded ?? null,
         stale,
         cacheStatus: stale ? 'stale' : 'fresh',
-        ageSeconds: Math.round(ageMs / 1000),
+        ageSeconds: ageMs === null ? null : Math.round(ageMs / 1000),
       });
     }
 
@@ -230,7 +260,7 @@ export const worker: ExportedHandler<Env> = {
         cache_age_bucket: cacheAgeBucket(ageMs),
         cache_present: cachedPayload !== null,
       });
-      captureStaleness(ageMs);
+      captureStaleness(effectiveAgeMs(ageMs));
     }
   },
 };

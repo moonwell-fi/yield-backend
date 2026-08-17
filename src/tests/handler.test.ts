@@ -119,7 +119,7 @@ describe('fetch handler', () => {
     expect(mockRefreshCache).not.toHaveBeenCalled();
   });
 
-  it('serves a cache with an unparseable uploaded timestamp as stale', async () => {
+  it('serves a cache with an unparseable uploaded timestamp as stale, without a bogus Age', async () => {
     const env = makeEnv(makeBucket({ uploaded: 'not-a-date', data: yields }));
 
     const res = await runFetch(env);
@@ -128,6 +128,19 @@ describe('fetch handler', () => {
     expect(res.status).toBe(200);
     expect(body.stale).toBe(true);
     expect(res.headers.get('X-Cache-Status')).toBe('stale');
+    expect(res.headers.get('Age')).toBeNull();
+  });
+
+  it('serves a cache with no uploaded field as stale with uploaded: null', async () => {
+    const env = makeEnv(makeBucket({ data: yields }));
+
+    const res = await runFetch(env);
+    const body = await res.json() as Record<string, unknown>;
+
+    expect(res.status).toBe(200);
+    expect(body.stale).toBe(true);
+    expect(body.uploaded).toBeNull();
+    expect(res.headers.get('Age')).toBeNull();
   });
 
   it('refreshes inline when the cache is missing and serves the live payload', async () => {
