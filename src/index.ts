@@ -57,20 +57,71 @@ const parseCachedPayload = async (object: R2ObjectBody | null): Promise<CachedPa
   }
 };
 
+// A failed R2 read must not 500 the endpoint: report it and treat the cache as
+// absent so the caller falls through to a live refresh.
+const readCachedPayload = async (env: Env): Promise<CachedPayload | null> => {
+  const object = await env.MY_BUCKET.get(CACHE_URI).catch((error: unknown) => {
+    console.error('Failed to read cached payload from R2:', error);
+    logEvent('cache_read_error', { uri: CACHE_URI });
+    Sentry.captureException(error, {
+      tags: {
+        component: 'r2',
+        operation: 'cache_read',
+      },
+      extra: { uri: CACHE_URI },
+    });
+    return null;
+  });
+  return parseCachedPayload(object);
+};
+
+const cacheAgeMs = (payload: CachedPayload | null, nowMs: number): number => {
+  const uploadedMs = payload ? new Date(payload.uploaded).getTime() : Number.NaN;
+  // No cache, or an unparseable timestamp, counts as maximally stale rather than fresh.
+  return Number.isNaN(uploadedMs) ? Number.MAX_SAFE_INTEGER : Math.max(0, nowMs - uploadedMs);
+};
+
+// Fixed messages so Sentry issue grouping (and the dashboard alert rules in the
+// README) stay stable across both handlers.
+const captureStaleness = (ageMs: number): void => {
+  if (ageMs > MAX_STALE_AGE_MS) {
+    Sentry.captureMessage('yields cache stale beyond 6h', {
+      level: 'error',
+      tags: { component: 'freshness' },
+    });
+  } else if (ageMs > STALE_WARNING_AGE_MS) {
+    Sentry.captureMessage('yields cache stale beyond 30m', {
+      level: 'warning',
+      tags: { component: 'freshness' },
+    });
+  }
+};
+
+// The cron's failure path escalates on its own, but a cron that never runs at all
+// (trigger dropped by a deploy, R2 writes failing silently) produces no cron
+// failure to escalate — that was MOO-776's exact symptom. So the request path
+// alerts too, throttled per isolate so traffic volume cannot flood Sentry.
+const STALE_ALERT_THROTTLE_MS = 5 * 60_000;
+export const staleAlertState = { lastAlertMs: 0 };
+
+const captureStalenessThrottled = (ageMs: number, nowMs: number): void => {
+  if (ageMs <= STALE_WARNING_AGE_MS) return;
+  if (staleAlertState.lastAlertMs && nowMs - staleAlertState.lastAlertMs < STALE_ALERT_THROTTLE_MS) return;
+  staleAlertState.lastAlertMs = nowMs;
+  captureStaleness(ageMs);
+};
+
 export const worker: ExportedHandler<Env> = {
   async fetch(
     request: Request,
     env: Env,
     ctx: ExecutionContext
   ): Promise<Response> {
-    const object = await env.MY_BUCKET.get(CACHE_URI);
-    const cachedPayload = await parseCachedPayload(object);
+    const cachedPayload = await readCachedPayload(env);
     const nowMs = Date.now();
 
     if (cachedPayload) {
-      const uploadedMs = new Date(cachedPayload.uploaded).getTime();
-      // An unparseable timestamp counts as maximally stale rather than fresh.
-      const ageMs = Number.isNaN(uploadedMs) ? Number.MAX_SAFE_INTEGER : Math.max(0, nowMs - uploadedMs);
+      const ageMs = cacheAgeMs(cachedPayload, nowMs);
       const stale = ageMs >= CACHE_TTL_MS;
       Sentry.setTag('cache_state', stale ? 'stale' : 'fresh');
       Sentry.setTag('cache_age_bucket', cacheAgeBucket(ageMs));
@@ -87,6 +138,7 @@ export const worker: ExportedHandler<Env> = {
         cache_age_bucket: cacheAgeBucket(ageMs),
       });
       Sentry.setTag('response_source', stale ? 'stale_cache' : 'fresh_cache');
+      if (stale) captureStalenessThrottled(ageMs, nowMs);
       return respond(cachedPayload.data, 200, {
         uploaded: cachedPayload.uploaded,
         stale,
@@ -127,27 +179,16 @@ export const worker: ExportedHandler<Env> = {
     } catch {
       // refreshCache already reported the upstream error to Sentry; escalate
       // here based on how stale the served data is getting so alert rules can
-      // page before users notice. Fixed messages keep Sentry issue grouping stable.
-      const object = await env.MY_BUCKET.get(CACHE_URI).catch(() => null);
-      const cachedPayload = await parseCachedPayload(object);
-      const uploadedMs = cachedPayload ? new Date(cachedPayload.uploaded).getTime() : Number.NaN;
-      const ageMs = Number.isNaN(uploadedMs) ? Number.MAX_SAFE_INTEGER : Date.now() - uploadedMs;
+      // page before users notice.
+      const cachedPayload = await readCachedPayload(env);
+      const ageMs = cacheAgeMs(cachedPayload, Date.now());
       logEvent('scheduled_refresh_failed', {
         uri: CACHE_URI,
         cache_age_ms: ageMs,
         cache_age_bucket: cacheAgeBucket(ageMs),
+        cache_present: cachedPayload !== null,
       });
-      if (ageMs > MAX_STALE_AGE_MS) {
-        Sentry.captureMessage('yields cache stale beyond 6h', {
-          level: 'error',
-          tags: { component: 'freshness' },
-        });
-      } else if (ageMs > STALE_WARNING_AGE_MS) {
-        Sentry.captureMessage('yields cache stale beyond 30m', {
-          level: 'warning',
-          tags: { component: 'freshness' },
-        });
-      }
+      captureStaleness(ageMs);
     }
   },
 };

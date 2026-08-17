@@ -18,9 +18,12 @@ A Cloudflare Worker that provides real-time market and vault information for the
 Returns the current market and vault yield information.
 
 The response carries freshness metadata: `uploaded` (ISO timestamp of when the
-data was fetched) and `stale` (`true` when the cache is older than the 3-minute
-refresh interval — the data is still served, but consumers can decide how much
-to trust it). The same information is exposed via the `Age` (seconds) and
+data was fetched) and `stale` (`true` once the cache is older than
+`CACHE_TTL_MS` in `src/policy.ts` — 7 minutes, i.e. the 3-minute refresh
+interval plus one fully missed cron tick, so `stale` means the refresh pipeline
+is actually broken rather than merely due. The data is still served, but
+consumers can decide how much to trust it). The same information is exposed via
+the `Age` (seconds) and
 `X-Cache-Status` (`live` | `fresh` | `stale`) response headers.
 
 Example response:
@@ -226,7 +229,7 @@ A cron trigger (`wrangler.toml` `[triggers]`, every 3 minutes) runs the
 (`market-vault-yields.json`). Requests always serve the blob directly and never
 refresh inline (except on a cold/empty bucket). If refreshes keep failing, the
 API keeps serving the last good data flagged `"stale": true` — it does not 503
-unless `HARD_FAIL_AFTER_MAX_STALE` is flipped in `src/index.ts`.
+unless `HARD_FAIL_AFTER_MAX_STALE` is flipped in `src/policy.ts`.
 
 ### Check freshness
 
@@ -264,7 +267,11 @@ the cron refresh is failing — check Sentry and `wrangler tail`.
 
 ### Sentry alert rules (configured in the Sentry dashboard)
 
-Alert on these fixed messages emitted by the `scheduled` handler:
+Alert on these fixed messages. The `scheduled` handler emits them when a refresh
+fails; the request path emits the same two staleness messages (throttled to once
+per 5 minutes per isolate) so a cron that never runs at all — trigger dropped by
+a deploy, R2 writes failing silently — still pages instead of quietly serving
+`"stale": true` forever.
 
 - `yields cache stale beyond 30m` (warning) — refresh has been failing for 30+
   minutes.

@@ -1,10 +1,11 @@
 import { describe, it, expect, vi, beforeAll, beforeEach } from 'vitest';
 import * as Sentry from '@sentry/cloudflare';
-import { worker } from '../index';
+import { worker, staleAlertState } from '../index';
 import {
   shouldHardFail,
   CACHE_TTL_MS,
   MAX_STALE_AGE_MS,
+  REFRESH_INTERVAL_MS,
   STALE_WARNING_AGE_MS,
 } from '../policy';
 import { refreshCache, CACHE_URI, type Env } from '../refresh';
@@ -68,6 +69,8 @@ const runScheduled = async (env: Env): Promise<void> =>
 
 beforeEach(() => {
   mockRefreshCache.mockReset();
+  // Per-isolate throttle state; reset so tests don't throttle each other.
+  staleAlertState.lastAlertMs = 0;
 });
 
 describe('fetch handler', () => {
@@ -85,6 +88,19 @@ describe('fetch handler', () => {
     expect(res.headers.get('X-Cache-Status')).toBe('fresh');
     expect(Number(res.headers.get('Age'))).toBeGreaterThanOrEqual(29);
     expect(mockRefreshCache).not.toHaveBeenCalled();
+  });
+
+  it('does not flag a blob as stale just because the next cron tick is due', async () => {
+    // A healthy worker's blob routinely reaches one refresh interval in age in the
+    // gap before the next tick lands; that must not read as stale.
+    const uploaded = new Date(Date.now() - REFRESH_INTERVAL_MS - 20_000).toISOString();
+    const env = makeEnv(makeBucket({ uploaded, data: yields }));
+
+    const res = await runFetch(env);
+    const body = await res.json() as Record<string, unknown>;
+
+    expect(body.stale).toBe(false);
+    expect(res.headers.get('X-Cache-Status')).toBe('fresh');
   });
 
   it('serves a stale cache with stale:true and leaves refreshing to the cron', async () => {
@@ -150,6 +166,46 @@ describe('fetch handler', () => {
 
     expect(res.status).toBe(200);
     expect(res.headers.get('X-Cache-Status')).toBe('live');
+  });
+
+  it('refreshes inline instead of failing when the R2 read throws', async () => {
+    const bucket: BucketStub = {
+      get: vi.fn(async () => { throw new Error('r2 unavailable'); }),
+      put: vi.fn(),
+    };
+    const env = makeEnv(bucket);
+    mockRefreshCache.mockResolvedValue({ uploaded: new Date().toISOString(), data: yields });
+
+    const res = await runFetch(env);
+
+    expect(res.status).toBe(200);
+    expect(res.headers.get('X-Cache-Status')).toBe('live');
+    expect(vi.mocked(Sentry.captureException)).toHaveBeenCalled();
+  });
+
+  it('alerts from the request path when a very stale cache is served, then throttles', async () => {
+    const uploaded = new Date(Date.now() - MAX_STALE_AGE_MS - 60_000).toISOString();
+    const env = makeEnv(makeBucket({ uploaded, data: yields }));
+
+    await runFetch(env);
+
+    expect(vi.mocked(Sentry.captureMessage)).toHaveBeenCalledWith(
+      'yields cache stale beyond 6h',
+      expect.objectContaining({ level: 'error' }),
+    );
+
+    vi.mocked(Sentry.captureMessage).mockClear();
+    await runFetch(env);
+    expect(vi.mocked(Sentry.captureMessage)).not.toHaveBeenCalled();
+  });
+
+  it('does not alert from the request path for a mildly stale cache', async () => {
+    const uploaded = new Date(Date.now() - CACHE_TTL_MS - 60_000).toISOString();
+    const env = makeEnv(makeBucket({ uploaded, data: yields }));
+
+    await runFetch(env);
+
+    expect(vi.mocked(Sentry.captureMessage)).not.toHaveBeenCalled();
   });
 });
 
