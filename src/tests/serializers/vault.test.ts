@@ -1,10 +1,13 @@
 import { describe, it, expect } from 'vitest';
-import type { MorphoVault, TokenConfig, Amount, MorphoVaultMarket, MorphoReward } from '@moonwell-fi/moonwell-sdk';
+import type { MorphoVault, TokenConfig } from '@moonwell-fi/moonwell-sdk';
 import { serializeVault } from '../../serializers/vault';
 import type { SerializedToken } from '../../serializers/token';
+import type { AmountLike } from '../../serializers/amount';
 
 describe('serializeVault', () => {
-  const mockToken: TokenConfig = {
+  // Loose fixtures; the SDK types drifted (Amount is a class, TokenConfig lost
+  // chainId), and the serializers intentionally accept partial/legacy shapes.
+  const mockToken = {
     address: '0x123',
     name: 'Test Token',
     symbol: 'TEST',
@@ -13,7 +16,7 @@ describe('serializeVault', () => {
     logoURI: null,
     isNative: false,
     wrapped: null
-  };
+  } as unknown as TokenConfig;
 
   const serializedToken: SerializedToken = {
     address: '0x123',
@@ -22,12 +25,12 @@ describe('serializeVault', () => {
     decimals: 18
   };
 
-  const mockAmount: Amount = {
+  const mockAmount: AmountLike = {
     value: '1000000000000000000',
     decimals: 18
   };
 
-  const mockReward: MorphoReward = {
+  const mockReward = {
     marketId: 'TEST-MARKET',
     asset: mockToken,
     supplyApr: 0.05,
@@ -36,7 +39,7 @@ describe('serializeVault', () => {
     borrowAmount: 500
   };
 
-  const mockMarket: MorphoVaultMarket = {
+  const mockMarket = {
     marketId: 'TEST-MARKET',
     allocation: 0.5,
     marketCollateral: mockToken,
@@ -62,7 +65,7 @@ describe('serializeVault', () => {
   });
 
   it('should handle complete vault input', () => {
-    const vault: MorphoVault = {
+    const vault = {
       vaultKey: 'TEST-VAULT',
       chainId: 1,
       vaultToken: mockToken,
@@ -80,7 +83,7 @@ describe('serializeVault', () => {
       totalSupplyUsd: 500000,
       markets: [mockMarket],
       rewards: [mockReward]
-    };
+    } as unknown as MorphoVault;
 
     const expectedResult = {
       vaultKey: 'TEST-VAULT',
@@ -160,8 +163,8 @@ describe('serializeVault', () => {
   });
 
   it('should combine Morpho-native rewards with staking rewards', () => {
-    const wellToken: TokenConfig = { ...mockToken, address: '0xWELL', symbol: 'WELL' };
-    const vault: Partial<MorphoVault> = {
+    const wellToken = { ...mockToken, address: '0xWELL', symbol: 'WELL' };
+    const vault = {
       vaultKey: 'COMBINED-VAULT',
       baseApy: 0.02,
       rewardsApy: 0.01,
@@ -169,7 +172,7 @@ describe('serializeVault', () => {
       rewards: [mockReward],
       stakingRewardsApr: 0.05,
       stakingRewards: [{ apr: 0.05, token: wellToken }]
-    };
+    } as unknown as Partial<MorphoVault>;
 
     const result = serializeVault(vault);
     expect(result?.rewardsApy).toBeCloseTo(0.06);

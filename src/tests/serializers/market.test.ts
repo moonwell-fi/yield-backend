@@ -1,10 +1,13 @@
 import { describe, it, expect } from 'vitest';
-import type { Market, TokenConfig, Amount, MarketReward } from '@moonwell-fi/moonwell-sdk';
+import type { Market, TokenConfig } from '@moonwell-fi/moonwell-sdk';
 import { serializeMarket } from '../../serializers/market';
 import type { SerializedToken } from '../../serializers/token';
+import type { AmountLike } from '../../serializers/amount';
 
 describe('serializeMarket', () => {
-  const mockToken: TokenConfig = {
+  // Loose fixtures; the SDK types drifted (Amount is a class, TokenConfig lost
+  // chainId), and the serializers intentionally accept partial/legacy shapes.
+  const mockToken = {
     address: '0x123',
     name: 'Test Token',
     symbol: 'TEST',
@@ -13,7 +16,7 @@ describe('serializeMarket', () => {
     logoURI: null,
     isNative: false,
     wrapped: null
-  };
+  } as unknown as TokenConfig;
 
   const serializedToken: SerializedToken = {
     address: '0x123',
@@ -22,12 +25,12 @@ describe('serializeMarket', () => {
     decimals: 18
   };
 
-  const mockAmount: Amount = {
+  const mockAmount: AmountLike = {
     value: '1000000000000000000',
     decimals: 18
   };
 
-  const mockReward: MarketReward = {
+  const mockReward = {
     token: mockToken,
     supplyApr: 0.05,
     borrowApr: 0.1,
@@ -47,7 +50,7 @@ describe('serializeMarket', () => {
   });
 
   it('should handle complete market input', () => {
-    const market: Market = {
+    const market = {
       // Basic market info
       marketKey: 'TEST-MARKET',
       chainId: 1,
@@ -92,7 +95,7 @@ describe('serializeMarket', () => {
 
       // Rewards
       rewards: [mockReward]
-    };
+    } as unknown as Market;
 
     const expectedResult = {
       // Basic market info
