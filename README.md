@@ -17,9 +17,20 @@ A Cloudflare Worker that provides real-time market and vault information for the
 
 Returns the current market and vault yield information.
 
+The response carries freshness metadata: `uploaded` (ISO timestamp of when the
+data was fetched) and `stale` (`true` once the cache is older than
+`CACHE_TTL_MS` in `src/policy.ts` — 7 minutes, i.e. the 3-minute refresh
+interval plus one fully missed cron tick, so `stale` means the refresh pipeline
+is actually broken rather than merely due. The data is still served, but
+consumers can decide how much to trust it). The same information is exposed via
+the `Age` (seconds) and
+`X-Cache-Status` (`live` | `fresh` | `stale`) response headers.
+
 Example response:
 ```json
 {
+  "uploaded": "2026-08-17T16:00:00.000Z",
+  "stale": false,
   "markets": {
     [marketKey: string]: {
       "marketKey": string,
@@ -208,3 +219,61 @@ requests are performance-traced; handled upstream and cache failures are
 reported with low-cardinality component and operation tags. Each event is tied
 to the deployed Cloudflare Worker version, and Cloudflare source maps are
 uploaded for readable Worker log stack traces.
+
+## Operations
+
+### How data stays fresh
+
+A cron trigger (`wrangler.toml` `[triggers]`, every 3 minutes) runs the
+`scheduled` handler, which fetches fresh data and rewrites the R2 blob
+(`market-vault-yields.json`). Requests always serve the blob directly and never
+refresh inline (except on a cold/empty bucket). If refreshes keep failing, the
+API keeps serving the last good data flagged `"stale": true` — it does not 503
+unless `HARD_FAIL_AFTER_MAX_STALE` is flipped in `src/policy.ts`.
+
+### Check freshness
+
+```bash
+curl -s https://yield-backend.moonwell.workers.dev/ | jq '{uploaded, stale}'
+```
+
+```bash
+curl -sI https://yield-backend.moonwell.workers.dev/ | grep -i -e '^age' -e 'x-cache-status'
+```
+
+`uploaded` should never be more than a few minutes old. If `stale` is `true`,
+the cron refresh is failing — check Sentry and `wrangler tail`.
+
+### Deploy safely
+
+- `wrangler deploy` **replaces all dashboard plaintext vars** with the `[vars]`
+  block in `wrangler.toml`. Anything not in the repo must be a wrangler secret:
+  `npx wrangler secret put BASE_RPC_URL`. Secrets survive deploys.
+- Deploy from a clean install (`npm ci`) so the bundled SDK matches the
+  lockfile — the bundle is built from your local `node_modules`.
+
+### Debugging
+
+- Live logs: `npx wrangler tail yield-backend --format pretty`.
+- Sentry tags: `response_source` (`live` / `fresh_cache` / `stale_cache` /
+  `unavailable`), `cache_state`, `cache_age_bucket`, and `upstream_branch`
+  (which refresh stage threw: `moonwell_markets`, `moonwell_morpho_vaults`,
+  `serialize_payload`, `morpho_blue_vault_rewards`, `apply_vault_rewards`).
+- The Lunar Indexer is reached via `https://lunar-services-worker.moonwell.fi`
+  (set in `src/refresh.ts`). The SDK's default `workers.dev` host is
+  unreachable from Cloudflare Workers (same-account restriction) — if the SDK
+  ever falls back to on-chain vault fetching, look for
+  `Failed to fetch vaults from Lunar Indexer` in the logs.
+
+### Sentry alert rules (configured in the Sentry dashboard)
+
+Alert on these fixed messages. The `scheduled` handler emits them when a refresh
+fails; the request path emits the same two staleness messages (throttled to once
+per 5 minutes per isolate) so a cron that never runs at all — trigger dropped by
+a deploy, R2 writes failing silently — still pages instead of quietly serving
+`"stale": true` forever.
+
+- `yields cache stale beyond 30m` (warning) — refresh has been failing for 30+
+  minutes.
+- `yields cache stale beyond 6h` (error) — served data is seriously outdated.
+- `BASE_RPC_URL binding is missing` (fatal) — a deploy wiped the RPC secret.

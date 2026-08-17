@@ -1,7 +1,18 @@
-import type { Amount } from '@moonwell-fi/moonwell-sdk';
+// The public API's amount shape ({value, decimals}); SDK Amount instances
+// (value/exponential/base) serialize with decimals defaulting to 0.
+export interface SerializedAmount {
+  value: string;
+  decimals: number;
+}
+
+// Loose input: SDK Amount instances or plain {value, decimals} objects.
+export interface AmountLike {
+  value?: string | number | bigint | null;
+  decimals?: unknown;
+}
 
 // Helper function to safely serialize amount objects
-export const serializeAmount = (amount: Partial<Amount> | null | undefined): Amount | null => {
+export const serializeAmount = (amount: AmountLike | null | undefined): SerializedAmount | null => {
   if (!amount) return null;
 
   // Handle value

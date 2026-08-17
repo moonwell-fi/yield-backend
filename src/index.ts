@@ -1,240 +1,195 @@
 import * as Sentry from '@sentry/cloudflare';
-import { createMoonwellClient } from '@moonwell-fi/moonwell-sdk';
 import type { ExecutionContext } from '@cloudflare/workers-types';
-import { serializeMarket } from './serializers/market';
-import { serializeVault } from './serializers/vault';
-import { mapVaultsToLegacyKeys } from './serializers/legacyVaults';
-import { fetchVaultRewards } from './serializers/vaultRewards';
 import { createSentryOptions } from './sentry';
+import { logEvent, cacheAgeBucket } from './log';
+import { CACHE_URI, refreshCache, type CachedPayload, type Env } from './refresh';
+import { CACHE_TTL_MS, MAX_STALE_AGE_MS, STALE_WARNING_AGE_MS, shouldHardFail } from './policy';
+
+export type { Env };
 
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Methods': 'GET,HEAD,POST,OPTIONS',
   'Access-Control-Allow-Headers': 'content-type,sentry-trace,baggage',
+  'Access-Control-Expose-Headers': 'Age, X-Cache-Status',
   'Access-Control-Max-Age': '86400',
   'content-type': 'application/json'
 }
 
-const respond = (response: Record<string, unknown>, code: number = 200): Response => {
-  const body = JSON.stringify(response, null, 2);
+interface ResponseMeta {
+  uploaded: string;
+  stale: boolean;
+  cacheStatus: 'live' | 'fresh' | 'stale';
+  ageSeconds: number;
+}
+
+const respond = (response: Record<string, unknown>, code: number = 200, meta?: ResponseMeta): Response => {
+  const body = JSON.stringify(
+    meta ? { uploaded: meta.uploaded, stale: meta.stale, ...response } : response,
+    null,
+    2,
+  );
   const init = {
     status: code,
-    headers: corsHeaders,
+    headers: meta
+      ? { ...corsHeaders, 'Age': String(meta.ageSeconds), 'X-Cache-Status': meta.cacheStatus }
+      : corsHeaders,
     statusText: code === 200 ? 'OK' : 'Error'
   };
-  const res = new Response(body, init);
-  
-  // Log response for debugging
-  console.log('Created response:', res);
-  console.log('Response type:', typeof res);
-  console.log('Response properties:', Object.keys(res));
-  
-  return res;
+  return new Response(body, init);
 }
 
-const logEvent = (event: string, details: Record<string, unknown> = {}): void => {
-  console.log(JSON.stringify({
-    event,
-    ts: new Date().toISOString(),
-    ...details,
-  }));
+const parseCachedPayload = async (object: R2ObjectBody | null): Promise<CachedPayload | null> => {
+  if (!object) return null;
+  try {
+    return await object.json() as CachedPayload;
+  } catch (error) {
+    console.error('Failed to parse cached payload from R2:', error);
+    logEvent('cache_parse_error', { uri: CACHE_URI });
+    Sentry.captureException(error, {
+      tags: {
+        component: 'r2',
+        operation: 'cache_parse',
+      },
+      extra: { uri: CACHE_URI },
+    });
+    return null;
+  }
 };
 
-const cacheAgeBucket = (ageMs: number | null): string => {
-  if (ageMs === null || Number.isNaN(ageMs)) return 'unknown';
-  if (ageMs < 60_000) return 'lt_1m';
-  if (ageMs < 180_000) return '1m_3m';
-  if (ageMs < 600_000) return '3m_10m';
-  if (ageMs < 3_600_000) return '10m_1h';
-  if (ageMs < 21_600_000) return '1h_6h';
-  if (ageMs < 86_400_000) return '6h_24h';
-  return 'gt_24h';
+// A failed R2 read must not 500 the endpoint: report it and treat the cache as
+// absent so the caller falls through to a live refresh.
+const readCachedPayload = async (env: Env): Promise<CachedPayload | null> => {
+  const object = await env.MY_BUCKET.get(CACHE_URI).catch((error: unknown) => {
+    console.error('Failed to read cached payload from R2:', error);
+    logEvent('cache_read_error', { uri: CACHE_URI });
+    Sentry.captureException(error, {
+      tags: {
+        component: 'r2',
+        operation: 'cache_read',
+      },
+      extra: { uri: CACHE_URI },
+    });
+    return null;
+  });
+  return parseCachedPayload(object);
 };
 
-export interface Env {
-  MY_BUCKET: R2Bucket;
-  BASE_RPC_URL: string;
-  SENTRY_DSN?: string;
-  SENTRY_ENVIRONMENT?: string;
-  SENTRY_RELEASE?: string;
-  CF_VERSION_METADATA: WorkerVersionMetadata;
-}
+const cacheAgeMs = (payload: CachedPayload | null, nowMs: number): number => {
+  const uploadedMs = payload ? new Date(payload.uploaded).getTime() : Number.NaN;
+  // No cache, or an unparseable timestamp, counts as maximally stale rather than fresh.
+  return Number.isNaN(uploadedMs) ? Number.MAX_SAFE_INTEGER : Math.max(0, nowMs - uploadedMs);
+};
 
-const worker: ExportedHandler<Env> = {
+// Fixed messages so Sentry issue grouping (and the dashboard alert rules in the
+// README) stay stable across both handlers.
+const captureStaleness = (ageMs: number): void => {
+  if (ageMs > MAX_STALE_AGE_MS) {
+    Sentry.captureMessage('yields cache stale beyond 6h', {
+      level: 'error',
+      tags: { component: 'freshness' },
+    });
+  } else if (ageMs > STALE_WARNING_AGE_MS) {
+    Sentry.captureMessage('yields cache stale beyond 30m', {
+      level: 'warning',
+      tags: { component: 'freshness' },
+    });
+  }
+};
+
+// The cron's failure path escalates on its own, but a cron that never runs at all
+// (trigger dropped by a deploy, R2 writes failing silently) produces no cron
+// failure to escalate — that was MOO-776's exact symptom. So the request path
+// alerts too, throttled per isolate so traffic volume cannot flood Sentry.
+const STALE_ALERT_THROTTLE_MS = 5 * 60_000;
+export const staleAlertState = { lastAlertMs: 0 };
+
+const captureStalenessThrottled = (ageMs: number, nowMs: number): void => {
+  if (ageMs <= STALE_WARNING_AGE_MS) return;
+  if (staleAlertState.lastAlertMs && nowMs - staleAlertState.lastAlertMs < STALE_ALERT_THROTTLE_MS) return;
+  staleAlertState.lastAlertMs = nowMs;
+  captureStaleness(ageMs);
+};
+
+export const worker: ExportedHandler<Env> = {
   async fetch(
     request: Request,
     env: Env,
     ctx: ExecutionContext
   ): Promise<Response> {
-    const uri = 'market-vault-yields.json'
-    const object = await env.MY_BUCKET.get(uri)
-    let cachedPayload: { data: Record<string, unknown>, uploaded: string } | null = null;
+    const cachedPayload = await readCachedPayload(env);
     const nowMs = Date.now();
 
-    if (object) {
-      try {
-        cachedPayload = await object.json() as { data: Record<string, unknown>, uploaded: string };
-      } catch (error) {
-        console.error('Failed to parse cached payload from R2:', error);
-        logEvent('cache_parse_error', { uri });
-        Sentry.captureException(error, {
-          tags: {
-            component: 'r2',
-            operation: 'cache_parse',
-          },
-          extra: { uri },
-        });
-      }
-    }
+    if (cachedPayload) {
+      const ageMs = cacheAgeMs(cachedPayload, nowMs);
+      const stale = ageMs >= CACHE_TTL_MS;
+      Sentry.setTag('cache_state', stale ? 'stale' : 'fresh');
+      Sentry.setTag('cache_age_bucket', cacheAgeBucket(ageMs));
 
-    const cacheExists = cachedPayload !== null;
-    const cacheUploadedMs = cachedPayload ? new Date(cachedPayload.uploaded).getTime() : 0;
-    const cacheAgeMs = cacheExists ? (nowMs - cacheUploadedMs) : null;
-    const cacheIsStale = cacheExists && (Number.isNaN(cacheUploadedMs) || cacheUploadedMs < (nowMs - 180000));
-    const cacheState = !cacheExists ? 'missing' : cacheIsStale ? 'stale' : 'fresh';
-    Sentry.setTag('cache_state', cacheState);
-    Sentry.setTag('cache_age_bucket', cacheAgeBucket(cacheAgeMs));
-
-    if (!cacheExists || cacheIsStale) {
-      // Cache is missing or older than 180 seconds/3 minutes
-      console.log('Cache miss or stale - attempting to fetch fresh data...')
-      logEvent(cacheExists ? 'cache_stale' : 'cache_miss', {
-        uri,
-        cache_age_ms: cacheAgeMs,
-        cache_age_bucket: cacheAgeBucket(cacheAgeMs),
-      });
-      
-      let upstreamBranch = 'moonwell_markets';
-      try {
-        const moonwellClient = createMoonwellClient({
-          networks: {
-            base: {
-              rpcUrls: [env.BASE_RPC_URL],
-            },
-          },
-        });
-
-        const markets = await Sentry.startSpan(
-          { name: 'Moonwell markets', op: 'upstream.moonwell.markets' },
-          () => moonwellClient.getMarkets({chainId: 8453}),
-        );
-        upstreamBranch = 'moonwell_morpho_vaults';
-        const vaults = await Sentry.startSpan(
-          { name: 'Moonwell Morpho vaults', op: 'upstream.moonwell.morpho_vaults' },
-          () => moonwellClient.getMorphoVaults({includeRewards: true}),
-        );
-        upstreamBranch = 'serialize_payload';
-
-        // Create the output object
-        const output: {
-          markets: Record<string, any>;
-          vaults: Record<string, any>;
-        } = {
-          markets: {},
-          vaults: {}
-        };
-
-        // Serialize markets
-        markets.forEach(market => {
-          const serializedMarket = serializeMarket(market);
-          if (serializedMarket && serializedMarket.marketKey) {
-            output.markets[serializedMarket.marketKey] = serializedMarket;
-          }
-        });
-
-        // Serialize vaults and remap them onto the legacy public API keys
-        // (keeps each V1 vault's TVL and base APY; see mapVaultsToLegacyKeys).
-        output.vaults = mapVaultsToLegacyKeys(vaults.map(serializeVault));
-
-        // The SDK no longer exposes WELL reward APY on the vault objects, so
-        // fetch it from the Morpho Blue API and overlay it onto the served
-        // vaults. Failures degrade to base-APY-only (fetchVaultRewards never
-        // throws and returns an empty map), so this never blocks the response.
-        const vaultEntries = Object.values(output.vaults).filter(
-          (vault): vault is { vaultToken: { address: string }; baseApy: number } & Record<string, unknown> =>
-            typeof vault?.vaultToken?.address === 'string',
-        );
-        upstreamBranch = 'morpho_blue_vault_rewards';
-        const vaultRewardsByAddress = await Sentry.startSpan(
-          { name: 'Morpho Blue vault rewards', op: 'upstream.morpho_blue.vault_rewards' },
-          () => fetchVaultRewards(
-            vaultEntries.map((vault) => vault.vaultToken.address),
-          ),
-        );
-        upstreamBranch = 'apply_vault_rewards';
-        for (const vault of vaultEntries) {
-          const overlay = vaultRewardsByAddress.get(vault.vaultToken.address.toLowerCase());
-          if (!overlay) continue;
-          vault.rewards = overlay.rewards;
-          vault.rewardsApy = overlay.rewardsApy;
-          vault.totalApy = vault.baseApy + overlay.rewardsApy;
-        }
-
-        console.log('Successfully fetched fresh data');
-        logEvent('upstream_success', { uri });
-
-        // Cache the data (non-fatal if cache write fails)
-        try {
-          await env.MY_BUCKET.put(uri, JSON.stringify({
-            uploaded: new Date(),
-            data: output
-          }));
-        } catch (error) {
-          console.error('Failed to update cache in R2:', error);
-          logEvent('cache_write_error', { uri });
-          Sentry.captureException(error, {
-            tags: {
-              component: 'r2',
-              operation: 'cache_write',
-            },
-            extra: { uri },
-          });
-        }
-
-        Sentry.setTag('response_source', 'live');
-        return respond(output);
-      } catch (error) {
-        // SDK request failed - try to return stale cached data as fallback
-        console.error('SDK request failed:', error);
-        logEvent('upstream_error', { uri });
-        Sentry.captureException(error, {
-          tags: {
-            component: 'upstream',
-            upstream_branch: upstreamBranch,
-            cache_available: String(cacheExists),
-          },
-          extra: { uri },
-        });
-        
-        if (cachedPayload) {
-          const cacheAge = Date.now() - new Date(cachedPayload.uploaded).getTime();
-          console.log(`Returning stale cached data as fallback (age: ${Math.round(cacheAge / 1000)}s)`);
-          logEvent('cache_fallback', {
-            uri,
-            cache_age_ms: cacheAge,
-            cache_age_bucket: cacheAgeBucket(cacheAge),
-          });
-          Sentry.setTag('response_source', 'stale_cache');
-          return respond(cachedPayload.data);
-        }
-        
-        // No cached data available at all
-        console.error('No cached data available for fallback');
-        logEvent('cache_fallback_unavailable', { uri });
+      if (stale && shouldHardFail(ageMs)) {
+        logEvent('cache_too_stale', { uri: CACHE_URI, cache_age_ms: ageMs });
         Sentry.setTag('response_source', 'unavailable');
-        return respond({ error: 'Service temporarily unavailable', message: 'Unable to fetch data and no cached data available' }, 503);
+        return respond({ error: 'Service temporarily unavailable', message: 'Cached data exceeded the maximum stale age' }, 503);
       }
+
+      logEvent(stale ? 'cache_hit_stale' : 'cache_hit_fresh', {
+        uri: CACHE_URI,
+        cache_age_ms: ageMs,
+        cache_age_bucket: cacheAgeBucket(ageMs),
+      });
+      Sentry.setTag('response_source', stale ? 'stale_cache' : 'fresh_cache');
+      if (stale) captureStalenessThrottled(ageMs, nowMs);
+      return respond(cachedPayload.data, 200, {
+        uploaded: cachedPayload.uploaded,
+        stale,
+        cacheStatus: stale ? 'stale' : 'fresh',
+        ageSeconds: Math.round(ageMs / 1000),
+      });
     }
 
-    // Return fresh cached data (within 180s TTL)
-    console.log('Cache hit - returning fresh cached data');
-    logEvent('cache_hit_fresh', {
-      uri,
-      cache_age_ms: cacheAgeMs,
-      cache_age_bucket: cacheAgeBucket(cacheAgeMs),
-    });
-    Sentry.setTag('response_source', 'fresh_cache');
-    return respond(cachedPayload!.data);
+    // Cold start: no cache blob at all (new bucket or wiped). Refresh inline so
+    // the first-ever request still gets data; afterwards the cron owns refreshes.
+    Sentry.setTag('cache_state', 'missing');
+    logEvent('cache_miss', { uri: CACHE_URI });
+    try {
+      const payload = await refreshCache(env);
+      Sentry.setTag('response_source', 'live');
+      return respond(payload.data, 200, {
+        uploaded: payload.uploaded,
+        stale: false,
+        cacheStatus: 'live',
+        ageSeconds: 0,
+      });
+    } catch {
+      // refreshCache already reported the upstream error to Sentry.
+      logEvent('cache_fallback_unavailable', { uri: CACHE_URI });
+      Sentry.setTag('response_source', 'unavailable');
+      return respond({ error: 'Service temporarily unavailable', message: 'Unable to fetch data and no cached data available' }, 503);
+    }
+  },
+
+  async scheduled(
+    controller: ScheduledController,
+    env: Env,
+    ctx: ExecutionContext
+  ): Promise<void> {
+    try {
+      await refreshCache(env);
+      logEvent('scheduled_refresh_success', { uri: CACHE_URI });
+    } catch {
+      // refreshCache already reported the upstream error to Sentry; escalate
+      // here based on how stale the served data is getting so alert rules can
+      // page before users notice.
+      const cachedPayload = await readCachedPayload(env);
+      const ageMs = cacheAgeMs(cachedPayload, Date.now());
+      logEvent('scheduled_refresh_failed', {
+        uri: CACHE_URI,
+        cache_age_ms: ageMs,
+        cache_age_bucket: cacheAgeBucket(ageMs),
+        cache_present: cachedPayload !== null,
+      });
+      captureStaleness(ageMs);
+    }
   },
 };
 

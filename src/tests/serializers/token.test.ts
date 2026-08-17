@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import type { TokenConfig } from '@moonwell-fi/moonwell-sdk';
+import type { TokenLike } from '../../serializers/token';
 import { serializeToken } from '../../serializers/token';
 
 describe('serializeToken', () => {
@@ -19,7 +19,7 @@ describe('serializeToken', () => {
   });
 
   it('should handle partial token input', () => {
-    const partialToken: Partial<TokenConfig> = {
+    const partialToken: TokenLike = {
       address: '0x123',
       name: 'Test Token',
       decimals: 18
@@ -34,7 +34,7 @@ describe('serializeToken', () => {
   });
 
   it('should handle complete token input', () => {
-    const token: TokenConfig = {
+    const token: TokenLike = {
       address: '0x123',
       name: 'Test Token',
       symbol: 'TEST',

@@ -1,6 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import type { Amount } from '@moonwell-fi/moonwell-sdk';
-import { serializeAmount } from '../../serializers/amount';
+import { serializeAmount, type AmountLike } from '../../serializers/amount';
 
 describe('serializeAmount', () => {
   it('should handle null input', () => {
@@ -17,7 +16,7 @@ describe('serializeAmount', () => {
   });
 
   it('should handle partial amount input', () => {
-    const partialAmount: Partial<Amount> = {
+    const partialAmount: AmountLike = {
       value: '1000000000000000000'
     };
     const result = serializeAmount(partialAmount);
@@ -28,7 +27,7 @@ describe('serializeAmount', () => {
   });
 
   it('should handle complete amount input', () => {
-    const amount: Amount = {
+    const amount: AmountLike = {
       value: '1000000000000000000',
       decimals: 18
     };
@@ -37,7 +36,7 @@ describe('serializeAmount', () => {
   });
 
   it('should handle numeric value input', () => {
-    const amount: Partial<Amount> = {
+    const amount: AmountLike = {
       value: 1000000000000000000n,
       decimals: 18
     };
@@ -59,7 +58,7 @@ describe('serializeAmount', () => {
   });
 
   it('should handle zero values', () => {
-    const amount: Partial<Amount> = {
+    const amount: AmountLike = {
       value: '0',
       decimals: 0
     };

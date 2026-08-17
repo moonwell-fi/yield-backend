@@ -1,5 +1,3 @@
-import type { TokenConfig } from '@moonwell-fi/moonwell-sdk';
-
 export interface SerializedToken {
   address: string;
   name: string;
@@ -7,8 +5,17 @@ export interface SerializedToken {
   decimals: number;
 }
 
+// Loose input: SDK TokenConfig objects or plain partial token shapes.
+export interface TokenLike {
+  address?: string | null;
+  name?: string | null;
+  symbol?: string | null;
+  decimals?: unknown;
+  [key: string]: unknown;
+}
+
 // Helper function to safely serialize token objects
-export const serializeToken = (token: Partial<TokenConfig> | null | undefined): SerializedToken | null => {
+export const serializeToken = (token: TokenLike | null | undefined): SerializedToken | null => {
   if (!token) return null;
   
   // Base token data that's always included
