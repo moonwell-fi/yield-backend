@@ -276,4 +276,7 @@ a deploy, R2 writes failing silently — still pages instead of quietly serving
 - `yields cache stale beyond 30m` (warning) — refresh has been failing for 30+
   minutes.
 - `yields cache stale beyond 6h` (error) — served data is seriously outdated.
+- `yields refresh returned empty payload` (error) — upstream degraded to an
+  empty dataset; the last good blob was preserved and will age into the
+  staleness alerts above.
 - `BASE_RPC_URL binding is missing` (fatal) — a deploy wiped the RPC secret.

@@ -15,5 +15,10 @@ export const MAX_STALE_AGE_MS = 6 * 3_600_000;
 export const HARD_FAIL_AFTER_MAX_STALE = false;
 export const STALE_WARNING_AGE_MS = 30 * 60_000;
 
+// Bound the inline (cold-cache) refresh path: per isolate, at most one refresh
+// attempt per this interval, so an R2 outage at full traffic costs one upstream
+// refresh per isolate per minute instead of one per request.
+export const INLINE_REFRESH_MIN_INTERVAL_MS = 60_000;
+
 export const shouldHardFail = (ageMs: number, hardFail: boolean = HARD_FAIL_AFTER_MAX_STALE): boolean =>
   hardFail && ageMs > MAX_STALE_AGE_MS;

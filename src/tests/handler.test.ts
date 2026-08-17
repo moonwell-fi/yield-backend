@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeAll, beforeEach } from 'vitest';
 import * as Sentry from '@sentry/cloudflare';
-import { worker, staleAlertState } from '../index';
+import { worker, staleAlertState, inlineRefreshState } from '../index';
 import {
   shouldHardFail,
   CACHE_TTL_MS,
@@ -69,8 +69,11 @@ const runScheduled = async (env: Env): Promise<void> =>
 
 beforeEach(() => {
   mockRefreshCache.mockReset();
-  // Per-isolate throttle state; reset so tests don't throttle each other.
+  // Per-isolate state; reset so tests don't throttle or feed each other.
   staleAlertState.lastAlertMs = 0;
+  inlineRefreshState.inFlight = null;
+  inlineRefreshState.lastAttemptMs = 0;
+  inlineRefreshState.lastPayload = null;
 });
 
 describe('fetch handler', () => {
@@ -183,6 +186,48 @@ describe('fetch handler', () => {
     expect(vi.mocked(Sentry.captureException)).toHaveBeenCalled();
   });
 
+  it('serves the isolate\'s last payload instead of refreshing when R2 becomes unavailable', async () => {
+    const uploaded = new Date(Date.now() - 30_000).toISOString();
+    // First request primes the isolate's in-memory copy from a healthy read.
+    await runFetch(makeEnv(makeBucket({ uploaded, data: yields })));
+
+    const failingBucket: BucketStub = {
+      get: vi.fn(async () => { throw new Error('r2 unavailable'); }),
+      put: vi.fn(),
+    };
+    const res = await runFetch(makeEnv(failingBucket));
+    const body = await res.json() as Record<string, unknown>;
+
+    expect(res.status).toBe(200);
+    expect(body.uploaded).toBe(uploaded);
+    expect(mockRefreshCache).not.toHaveBeenCalled();
+  });
+
+  it('shares a single in-flight refresh between concurrent cold requests', async () => {
+    const env = makeEnv(makeBucket(null));
+    mockRefreshCache.mockImplementation(() => new Promise((resolve) =>
+      setTimeout(() => resolve({ uploaded: new Date().toISOString(), data: yields }), 10),
+    ));
+
+    const [res1, res2] = await Promise.all([runFetch(env), runFetch(env)]);
+
+    expect(res1.status).toBe(200);
+    expect(res2.status).toBe(200);
+    expect(mockRefreshCache).toHaveBeenCalledOnce();
+  });
+
+  it('throttles repeated inline refresh attempts after a failure', async () => {
+    const env = makeEnv(makeBucket(null));
+    mockRefreshCache.mockRejectedValue(new Error('upstream down'));
+
+    const first = await runFetch(env);
+    const second = await runFetch(env);
+
+    expect(first.status).toBe(503);
+    expect(second.status).toBe(503);
+    expect(mockRefreshCache).toHaveBeenCalledOnce();
+  });
+
   it('alerts from the request path when a very stale cache is served, then throttles', async () => {
     const uploaded = new Date(Date.now() - MAX_STALE_AGE_MS - 60_000).toISOString();
     const env = makeEnv(makeBucket({ uploaded, data: yields }));
@@ -277,6 +322,25 @@ describe('fetchFreshYields config guard', () => {
       expect.stringContaining('BASE_RPC_URL'),
       expect.objectContaining({ level: 'fatal' }),
     );
+  });
+});
+
+describe('assertYieldsNotEmpty', () => {
+  it('rejects an empty payload so it cannot overwrite the last good blob', async () => {
+    const { assertYieldsNotEmpty } = await vi.importActual<typeof import('../refresh')>('../refresh');
+
+    expect(() => assertYieldsNotEmpty({ markets: {}, vaults: {} })).toThrow(/empty payload/);
+    expect(() => assertYieldsNotEmpty({ markets: { A: {} }, vaults: {} })).toThrow(/empty payload/);
+    expect(vi.mocked(Sentry.captureMessage)).toHaveBeenCalledWith(
+      'yields refresh returned empty payload',
+      expect.objectContaining({ level: 'error' }),
+    );
+  });
+
+  it('accepts a populated payload', async () => {
+    const { assertYieldsNotEmpty } = await vi.importActual<typeof import('../refresh')>('../refresh');
+
+    expect(() => assertYieldsNotEmpty({ markets: { A: {} }, vaults: { B: {} } })).not.toThrow();
   });
 });
 

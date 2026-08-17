@@ -122,8 +122,27 @@ export const fetchFreshYields = async (env: Pick<Env, 'BASE_RPC_URL'>): Promise<
   }
 };
 
+// A refresh that "succeeds" with an empty payload must not overwrite the last
+// good blob and get served as fresh — the SDK deliberately degrades to empty
+// collections on partial upstream failure instead of throwing (indexer records
+// all malformed, views read missing, allSettled environments), which is the
+// MOO-776 silent-failure class inverted. Throwing routes it through the normal
+// failure paths: the old blob keeps serving and ages into the staleness alerts.
+export const assertYieldsNotEmpty = (output: YieldsOutput): void => {
+  const marketCount = Object.keys(output.markets).length;
+  const vaultCount = Object.keys(output.vaults).length;
+  if (marketCount > 0 && vaultCount > 0) return;
+  logEvent('refresh_empty_payload', { uri: CACHE_URI, market_count: marketCount, vault_count: vaultCount });
+  Sentry.captureMessage('yields refresh returned empty payload', {
+    level: 'error',
+    tags: { component: 'upstream' },
+  });
+  throw new Error(`Refresh returned an empty payload (markets: ${marketCount}, vaults: ${vaultCount}) — refusing to overwrite the cached data`);
+};
+
 export const refreshCache = async (env: Env): Promise<CachedPayload> => {
   const output = await fetchFreshYields(env);
+  assertYieldsNotEmpty(output);
   const payload: CachedPayload = {
     uploaded: new Date().toISOString(),
     data: output,

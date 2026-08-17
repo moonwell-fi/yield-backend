@@ -3,7 +3,7 @@ import type { ExecutionContext } from '@cloudflare/workers-types';
 import { createSentryOptions } from './sentry';
 import { logEvent, cacheAgeBucket } from './log';
 import { CACHE_URI, refreshCache, type CachedPayload, type Env } from './refresh';
-import { CACHE_TTL_MS, MAX_STALE_AGE_MS, STALE_WARNING_AGE_MS, shouldHardFail } from './policy';
+import { CACHE_TTL_MS, INLINE_REFRESH_MIN_INTERVAL_MS, MAX_STALE_AGE_MS, STALE_WARNING_AGE_MS, shouldHardFail } from './policy';
 
 export type { Env };
 
@@ -111,14 +111,55 @@ const captureStalenessThrottled = (ageMs: number, nowMs: number): void => {
   captureStaleness(ageMs);
 };
 
+// Bound the inline refresh path: without this, an R2 outage sends every request
+// down the cold-start branch and each one fans out a full upstream refresh
+// (dozens of RPC subrequests). Per isolate: remember the last payload served and
+// fall back to it when R2 reads fail, share one in-flight refresh between
+// concurrent requests, and attempt at most one refresh per
+// INLINE_REFRESH_MIN_INTERVAL_MS — requests inside the throttle window get a 503
+// instead of stampeding upstream.
+export const inlineRefreshState: {
+  inFlight: Promise<CachedPayload> | null;
+  lastAttemptMs: number;
+  lastPayload: CachedPayload | null;
+} = { inFlight: null, lastAttemptMs: 0, lastPayload: null };
+
+const inlineRefresh = (env: Env, nowMs: number): Promise<CachedPayload> => {
+  if (inlineRefreshState.inFlight) return inlineRefreshState.inFlight;
+  if (inlineRefreshState.lastAttemptMs && nowMs - inlineRefreshState.lastAttemptMs < INLINE_REFRESH_MIN_INTERVAL_MS) {
+    logEvent('inline_refresh_throttled', { uri: CACHE_URI });
+    return Promise.reject(new Error('Inline refresh throttled after a recent attempt'));
+  }
+  inlineRefreshState.lastAttemptMs = nowMs;
+  const refresh = refreshCache(env)
+    .then((payload) => {
+      inlineRefreshState.lastPayload = payload;
+      return payload;
+    })
+    .finally(() => {
+      inlineRefreshState.inFlight = null;
+    });
+  inlineRefreshState.inFlight = refresh;
+  return refresh;
+};
+
 export const worker: ExportedHandler<Env> = {
   async fetch(
     request: Request,
     env: Env,
     ctx: ExecutionContext
   ): Promise<Response> {
-    const cachedPayload = await readCachedPayload(env);
+    let cachedPayload = await readCachedPayload(env);
     const nowMs = Date.now();
+
+    if (cachedPayload) {
+      inlineRefreshState.lastPayload = cachedPayload;
+    } else if (inlineRefreshState.lastPayload) {
+      // R2 read failed (or the blob vanished) but this isolate has served data
+      // before — reuse it rather than fanning out an upstream refresh.
+      cachedPayload = inlineRefreshState.lastPayload;
+      logEvent('cache_memory_fallback', { uri: CACHE_URI });
+    }
 
     if (cachedPayload) {
       const ageMs = cacheAgeMs(cachedPayload, nowMs);
@@ -152,7 +193,7 @@ export const worker: ExportedHandler<Env> = {
     Sentry.setTag('cache_state', 'missing');
     logEvent('cache_miss', { uri: CACHE_URI });
     try {
-      const payload = await refreshCache(env);
+      const payload = await inlineRefresh(env, nowMs);
       Sentry.setTag('response_source', 'live');
       return respond(payload.data, 200, {
         uploaded: payload.uploaded,
@@ -161,7 +202,8 @@ export const worker: ExportedHandler<Env> = {
         ageSeconds: 0,
       });
     } catch {
-      // refreshCache already reported the upstream error to Sentry.
+      // refreshCache reports upstream errors to Sentry itself; a throttled
+      // inline attempt only logs.
       logEvent('cache_fallback_unavailable', { uri: CACHE_URI });
       Sentry.setTag('response_source', 'unavailable');
       return respond({ error: 'Service temporarily unavailable', message: 'Unable to fetch data and no cached data available' }, 503);
